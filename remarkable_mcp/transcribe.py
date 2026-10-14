@@ -81,7 +81,7 @@ class Job:
     output_md: Optional[str] = None
     output_json: Optional[str] = None
     task: Optional[asyncio.Task] = None
-    # backend -> model override; "judge" -> adjudication model
+    # backend -> model override; "judge" -> adjudication model, "composer" -> PDF notes pass
     models: Dict[str, str] = field(default_factory=dict)
     document_id: Optional[str] = None
     modified: Optional[str] = None  # document modification time (ISO 8601)
@@ -228,6 +228,7 @@ TRANSCRIPT_LABELS: Dict[str, Dict[str, str]] = {
         "page_handwriting": "All handwriting on the page",
         "handwriting": "Handwriting",
         "illegible": "{n} illegible",
+        "pen": "Pen",
     },
     "fi": {
         "source": "Lähde",
@@ -260,6 +261,7 @@ TRANSCRIPT_LABELS: Dict[str, Dict[str, str]] = {
         "page_handwriting": "Sivun käsiala kokonaan",
         "handwriting": "Käsiala",
         "illegible": "{n} lukukelvotonta",
+        "pen": "Kynä",
     },
 }
 
@@ -268,7 +270,19 @@ def marked_line(mark, lab: Optional[Dict[str, str]] = None) -> str:
     """One Markdown list line for a marked passage: its sentence, marks in bold."""
     if isinstance(mark, str):  # transcripts written before marks had context
         return f"- {mark}"
-    return f"- {mark.get('text') or mark.get('marked', '')}{pen_text(mark.get('pen'))}"
+    return f"- {mark.get('text') or mark.get('marked', '')}"
+
+
+def marked_lines(marks, lab: Optional[Dict[str, str]] = None, pens=None) -> List[str]:
+    """Marked passages as list lines, the pen named only where it changes."""
+    pens = pens if pens is not None else PenTracker(lab)
+    lines: List[str] = []
+    for mark in marks or []:
+        note = pens.line(mark.get("pen") if isinstance(mark, dict) else None)
+        if note:
+            lines += ([""] if lines else []) + [note, ""]
+        lines.append(marked_line(mark, lab))
+    return lines
 
 
 _PEN_FI = {
@@ -294,6 +308,51 @@ _PEN_FI = {
 }
 
 
+def _pen_parts(pen) -> List[str]:
+    if not pen:
+        return []
+    if isinstance(pen, str):
+        return [p.strip() for p in pen.split(",") if p.strip()]
+    width = pen.get("width_mm")
+    parts = [pen.get("tool"), pen.get("color"), f"{width} mm" if width else None]
+    return [str(p) for p in parts if p]
+
+
+# A pen counts as changed when its tool or colour differs, or its line is at
+# least this many times wider or thinner (pressure alone varies it less).
+PEN_WIDTH_CHANGE = 1.5
+
+
+class PenTracker:
+    """Names the pen once, then again only when the tool, colour or width changes."""
+
+    def __init__(self, lab: Optional[Dict[str, str]] = None):
+        self.lab = lab or labels()
+        self.last = None
+
+    def changed(self, pen) -> bool:
+        if not pen:
+            return False
+        if self.last is None:
+            return True
+        if isinstance(pen, str) or isinstance(self.last, str):
+            return pen != self.last
+        if (pen.get("tool"), pen.get("color")) != (self.last.get("tool"), self.last.get("color")):
+            return True
+        a, b = pen.get("width_mm"), self.last.get("width_mm")
+        if not a or not b:
+            return False
+        return max(a, b) / max(min(a, b), 1e-6) >= PEN_WIDTH_CHANGE
+
+    def line(self, pen) -> Optional[str]:
+        """'_✒ Pen: calligraphy pen, black, 0.26 mm_' when the pen changed, else None."""
+        if not self.changed(pen):
+            return None
+        self.last = pen
+        text = pen_text(pen).strip()
+        return f"_✒ {self.lab['pen']}: {text[2:-2]}_" if text else None
+
+
 def pen_text(pen) -> str:
     """' _(calligraphy pen, black, 0.26 mm)_' in the transcript language, '' for none."""
     if not pen:
@@ -315,11 +374,23 @@ def _symbols(symbols) -> str:
     return (" ✎ " + " ".join(f"**{m}**" for m in marks)) if marks else ""
 
 
-def annotation_lines(ann: dict, lab: Optional[Dict[str, str]] = None) -> List[str]:
-    """Markdown for a page's composed annotations: passages, tables, loose notes."""
+def annotation_lines(
+    ann: dict, lab: Optional[Dict[str, str]] = None, pens: Optional[PenTracker] = None
+) -> List[str]:
+    """Markdown for a page's composed annotations: passages, tables, loose notes.
+
+    The pen is named before the first item and again only where it changes;
+    pass one ``pens`` tracker across pages to carry that over page breaks.
+    """
     lab = lab or labels()
+    pens = pens if pens is not None else PenTracker(lab)
     lines = [f"_{lab['annotations']}:_", ""]
     for item in ann.get("items") or []:
+        note = pens.line(item.get("pen"))
+        if note:
+            if lines[-1] != "":
+                lines.append("")
+            lines += [note, ""]
         if item.get("type") == "table":
             headers = [str(h) for h in item.get("headers") or []]
             rows = [r for r in item.get("rows") or []]
@@ -340,7 +411,6 @@ def annotation_lines(ann: dict, lab: Optional[Dict[str, str]] = None) -> List[st
         label = f"**({item['label']})** " if item.get("label") else ""
         lines.append(
             f"- {label}{item.get('quote', '')}{_symbols(item.get('symbols'))}"
-            f"{pen_text(item.get('pen'))}"
         )
         if item.get("note"):
             lines.append(f"  - ✍ {item['note']}")
@@ -414,7 +484,10 @@ _LABELS = {"anthropic": "Claude", "gemini": "Gemini"}
 def write_outputs(job: Job) -> None:
     out = transcript_dir()
     out.mkdir(parents=True, exist_ok=True)
-    tags = [f"judge {job.models[b]}" if b == "judge" else job.models[b] for b in sorted(job.models)]
+    tags = [
+        f"{b} {job.models[b]}" if b in ("judge", "composer") else job.models[b]
+        for b in sorted(job.models)
+    ]
     base = out / _safe_name(job.path, " + ".join(tags))
     readers = " + ".join(
         _LABELS.get(b, b) + (f" ({job.models[b]})" if b in job.models else "")
@@ -432,6 +505,7 @@ def write_outputs(job: Job) -> None:
         lines[-1] += "  "
         lines.append(f"{lab['legend']}: {lab['legend_text']}")
     lines.append("")
+    pens = PenTracker(lab)
     for p in sorted(job.results):
         r = job.results[p]
         if r.status == "blank":
@@ -441,13 +515,13 @@ def write_outputs(job: Job) -> None:
             lines += [f"_{lab['failed']}: {r.error}_", ""]
             continue
         if r.annotations:
-            lines += annotation_lines(r.annotations, lab) + [""]
+            lines += annotation_lines(r.annotations, lab, pens) + [""]
             if r.final:
                 lines += [f"<details><summary>{lab['page_handwriting']}</summary>", ""]
                 lines += [r.final, "", "</details>", ""]
             continue
         if r.marked:
-            lines += [f"_{lab['marked']}:_", ""] + [marked_line(m, lab) for m in r.marked] + [""]
+            lines += [f"_{lab['marked']}:_", ""] + marked_lines(r.marked, lab, pens) + [""]
         if not r.final:
             continue
         if job.mode == "dual":
@@ -671,7 +745,7 @@ async def _compose_page(job: Job, page: int, sem) -> None:
                 r.marked,
                 r.final,
                 180.0,
-                job.models.get("judge"),
+                job.models.get("composer"),
             )
             r.annotations = extract.checked_annotations(data, inputs["blocks"])
         except Exception as e:  # the geometric marks and the handwriting remain
@@ -916,7 +990,7 @@ def save_index(index: dict) -> None:
 
 def _is_main_run(job: Job) -> bool:
     """Full document with the configured models: the transcript the index tracks."""
-    if "judge" in job.models or len(job.pages) != job.total_pages:
+    if {"judge", "composer"} & set(job.models) or len(job.pages) != job.total_pages:
         return False
     return all(job.models.get(b) in (None, llm_ocr._model_for(b)) for b in MODES[job.mode])
 
@@ -968,7 +1042,7 @@ def transcript_page_text(page: dict, lab: Optional[Dict[str, str]] = None) -> st
     parts = []
     if page.get("marked"):
         parts.append(f"{lab['marked']}:")
-        parts += [marked_line(m, lab) for m in page["marked"]]
+        parts += [line for line in marked_lines(page["marked"], lab) if line]
     if page.get("final"):
         if parts:
             parts.append(f"{lab['handwriting']}:")

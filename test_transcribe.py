@@ -1165,3 +1165,27 @@ def test_table_blocks_are_recognised():
     words = row(10, 0) + row(30, 1) + row(50, 2)
     words += [(10, 100, 50, 110, "Plain", 4, 0, 0), (55, 100, 90, 110, "prose.", 4, 0, 1)]
     assert _table_blocks(words) == [(10, 10, 460, 60)]
+
+
+def test_pen_is_named_once_and_again_only_when_it_changes(monkeypatch):
+    monkeypatch.setenv("REMARKABLE_TRANSCRIPT_LANG", "fi")
+    cal = {"tool": "calligraphy pen", "color": "black", "width_mm": 0.24}
+    ann = {
+        "items": [
+            {"type": "passage", "quote": "one", "pen": cal},
+            {"type": "passage", "quote": "two", "pen": dict(cal, width_mm=0.27)},
+            {"type": "passage", "quote": "three", "pen": dict(cal, color="red")},
+            {"type": "passage", "quote": "four", "pen": dict(cal, color="red", width_mm=0.6)},
+        ]
+    }
+    pens = transcribe.PenTracker()
+    md = "\n".join(transcribe.annotation_lines(ann, pens=pens))
+    assert md.count("✒") == 3
+    assert "_✒ Kynä: kalligrafiakynä, musta, 0,24 mm_" in md
+    assert "(kalligrafiakynä" not in md  # no pen after each passage
+    # the same pen on the next page is not named again
+    md2 = "\n".join(transcribe.annotation_lines({"items": ann["items"][3:]}, pens=pens))
+    assert "✒" not in md2
+    marks = [{"text": "a **b**", "pen": cal}, {"text": "c **d**", "pen": cal}]
+    lines = transcribe.marked_lines(marks)
+    assert sum("✒" in line for line in lines) == 1 and lines[-1] == "- c **d**"

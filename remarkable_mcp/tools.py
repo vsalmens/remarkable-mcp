@@ -2819,6 +2819,7 @@ async def remarkable_transcribe(
     workers: int = 4,
     model: Optional[str] = None,
     judge: Optional[str] = None,
+    composer: Optional[str] = None,
 ) -> str:
     """
     <usecase>Transcribe a handwritten notebook or PDF annotations in the background.</usecase>
@@ -2850,6 +2851,9 @@ async def remarkable_transcribe(
     - judge: optional model for the final pass in dual mode (gemini-… or claude-…).
       The final pass sees the previous and next page as context; that context may
       only suggest a reading (word→suggestion (?)), never replace one.
+    - composer: optional model for the pass that ties notes, symbols and labels on
+      PDF pages to the marked passages (gemini-… or claude-…). Like model and judge,
+      it puts the model in the output file names, for A/B comparisons.
     </parameters>
     <examples>
     - remarkable_transcribe("Meeting Notes")
@@ -2886,6 +2890,16 @@ async def remarkable_transcribe(
                     suggestion='Example: judge="gemini-4-argon" with mode="dual".',
                 )
             models["judge"] = judge.strip()
+        if composer and composer.strip():
+            backend = llm_ocr.backend_for_model(composer)
+            if backend is None or not llm_ocr.has_credentials(backend):
+                return make_error(
+                    error_type="invalid_composer",
+                    message=f"Composer '{composer}' needs a gemini-… or claude-… id "
+                    "with its API key configured.",
+                    suggestion='Example: composer="claude-sonnet-5-5".',
+                )
+            models["composer"] = composer.strip()
         missing = [b for b in transcribe.MODES[mode] if not llm_ocr.has_credentials(b)]
         if missing:
             return make_error(

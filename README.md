@@ -760,9 +760,15 @@ Quotes are checked against the PDF's text and anything not found there is
 dropped; the page's full handwriting stays available below. The pass runs only
 where geometry cannot place the marks: pages with handwriting or drawn symbols,
 rings, highlights or marks in a table. Lines under or through running text
-already come out as whole sentences with the pen named (tool, colour, width).
+already come out as whole sentences.
 `REMARKABLE_COMPOSE_ANNOTATIONS=0` turns it off and
-`REMARKABLE_ANNOTATION_MODEL` picks the model.
+`REMARKABLE_ANNOTATION_MODEL` picks the model; `composer="…"` in
+`remarkable_transcribe` picks it for one run (the model goes into the file
+names, so A/B runs sit side by side).
+
+The pen (tool, colour, line width) is named once before the marks, as
+`✒ Pen: calligraphy pen, black, 0.24 mm`, and again only where it changes:
+another tool or colour, or a line at least 1.5 times wider or thinner.
 
 Ink is drawn with each pen's own width (calligraphy pen, ballpoint, fineliner
 and so on, after the tablet's pen models), so page images match the tablet.
