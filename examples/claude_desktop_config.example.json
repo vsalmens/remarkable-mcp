@@ -12,8 +12,7 @@
         "REMARKABLE_GEMINI_MODEL": "gemini-3.1-pro-preview",
         "REMARKABLE_TRANSCRIPT_DIR": "/Users/YOU/Documents/reMarkable-transcripts",
         "REMARKABLE_TRANSCRIPT_LANG": "en",
-        "REMARKABLE_AUTO_SYNC_MINUTES": "60",
-        "REMARKABLE_AUTO_SYNC_QUIET_HOURS": "23-7",
+        "REMARKABLE_AUTO_SYNC_AT": "7,16,23",
         "REMARKABLE_AUTO_SYNC_SETTLE_MINUTES": "10"
       }
     }

@@ -704,18 +704,14 @@ serve as an archive. Use `dry_run=True` to see the plan and `folder="/Journal"` 
 limit the scope. Progress: `remarkable_transcribe_status("sync-…")`. Run it by hand
 or from a scheduled task.
 
-**Automatic sync.** Set `REMARKABLE_AUTO_SYNC_MINUTES` (e.g. `60`) and the
-server checks the library that often and transcribes what is new or changed,
-so a notebook is transcribed soon after it syncs, not on a schedule. After a
-change it checks every `REMARKABLE_AUTO_SYNC_ACTIVE_MINUTES` (default 10) for
-`REMARKABLE_AUTO_SYNC_ACTIVE_HOURS` (default 3), so pages arrive quickly while
-you are writing and an idle library is rarely polled. A
-document is taken only once it has been left alone for
-`REMARKABLE_AUTO_SYNC_SETTLE_MINUTES` (default 10), so pages are not read while
-you are still writing. A run of more than `REMARKABLE_AUTO_SYNC_MAX_DOCS`
+**Automatic sync.** Set `REMARKABLE_AUTO_SYNC_AT` to local times of day
+(e.g. `7,16,23`), or `REMARKABLE_AUTO_SYNC_MINUTES` to an interval, and the
+server transcribes what is new or changed without being asked. A document is
+taken only once it has been left alone for `REMARKABLE_AUTO_SYNC_SETTLE_MINUTES`
+(default 10), so pages are not read while you are still writing; it is picked
+up at the next check. A run of more than `REMARKABLE_AUTO_SYNC_MAX_DOCS`
 documents (default 20, such as the very first pass) is left for a manual
-`remarkable_transcribe_sync()`. `REMARKABLE_AUTO_SYNC_QUIET_HOURS` (local
-time, e.g. `23-7`) skips the checks at night. Off by default.
+`remarkable_transcribe_sync()`. Off by default.
 
 `remarkable_transcribe_cancel(job_id)` stops a job or a sync (`"sync-…"`).
 Pages already finished are written out and stay cached.

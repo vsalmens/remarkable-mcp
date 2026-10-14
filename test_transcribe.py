@@ -909,9 +909,12 @@ def test_auto_sync_is_off_unless_configured(monkeypatch):
     assert tools.start_auto_sync() is None
 
 
-def test_quiet_hours_wrap_midnight():
-    from remarkable_mcp.tools import _in_quiet_hours
+def test_auto_sync_times_of_day():
+    from datetime import datetime
 
-    assert [h for h in range(24) if _in_quiet_hours("23-7", h)] == [0, 1, 2, 3, 4, 5, 6, 23]
-    assert [h for h in range(24) if _in_quiet_hours("1-3", h)] == [1, 2]
-    assert not _in_quiet_hours("", 2) and not _in_quiet_hours("nonsense", 2)
+    from remarkable_mcp.tools import _parse_times, _seconds_until_next
+
+    times = _parse_times("23, 7, 16:00, nonsense, 25")
+    assert times == [(7, 0), (16, 0), (23, 0)]
+    assert _seconds_until_next(times, datetime(2026, 10, 14, 16, 28)) == (6 * 60 + 32) * 60
+    assert _seconds_until_next(times, datetime(2026, 10, 14, 23, 0, 1)) == 8 * 3600 - 1
