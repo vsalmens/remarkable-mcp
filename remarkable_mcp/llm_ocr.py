@@ -359,7 +359,29 @@ def get_vocabulary() -> list:
     return terms
 
 
-def build_adjudication_prompt(readings: dict) -> str:
+CONTEXT_CHARS = 2000
+
+
+def _context_block(context: Optional[dict]) -> str:
+    """Neighbouring pages, so names and repeated words can be read consistently."""
+    if not context:
+        return ""
+    parts = []
+    for key, label in (("previous", "Previous page"), ("next", "Next page")):
+        text = (context.get(key) or "").strip()
+        if text:
+            parts.append(f"<{label}>\n{text[:CONTEXT_CHARS]}\n</{label}>")
+    if not parts:
+        return ""
+    return (
+        "\n\nNeighbouring pages of the same notebook, as read by one reader, for "
+        "context only. Do not transcribe them. Use them to resolve names, recurring "
+        "words and this writer's spelling, e.g. a signature that matches a heading on "
+        "the previous page.\n" + "\n".join(parts)
+    )
+
+
+def build_adjudication_prompt(readings: dict, context: Optional[dict] = None) -> str:
     labels = {"anthropic": "Reader A", "gemini": "Reader B"}
     blocks = []
     for backend, text in readings.items():
@@ -388,6 +410,7 @@ def build_adjudication_prompt(readings: dict) -> str:
         + _vocabulary_hint()
         + "Output only the final transcription.\n\n"
         + "\n\n".join(blocks)
+        + _context_block(context)
     )
 
 
@@ -404,13 +427,27 @@ def _vocabulary_hint() -> str:
     )
 
 
-def adjudicate_png(png: bytes, readings: dict, timeout: float = 180.0) -> Optional[str]:
-    """Final transcription from the image plus two readings (cached)."""
-    backend = os.environ.get("REMARKABLE_ADJUDICATOR", "anthropic").strip().lower()
-    if backend not in _CALLERS:
-        backend = "anthropic"
-    model = _model_for(backend)
-    prompt = build_adjudication_prompt(readings)
+def adjudicate_png(
+    png: bytes,
+    readings: dict,
+    timeout: float = 180.0,
+    context: Optional[dict] = None,
+    model: Optional[str] = None,
+) -> Optional[str]:
+    """Final transcription from the image plus two readings (cached).
+
+    ``context`` may hold the "previous" and "next" page text. ``model`` picks the
+    judge for this call (a gemini-... or claude-... id); otherwise
+    REMARKABLE_ADJUDICATOR chooses the backend and its configured model.
+    """
+    backend = backend_for_model(model) if model else None
+    if backend is None:
+        backend = os.environ.get("REMARKABLE_ADJUDICATOR", "anthropic").strip().lower()
+        if backend not in _CALLERS:
+            backend = "anthropic"
+        model = None
+    model = (model or "").strip() or _model_for(backend)
+    prompt = build_adjudication_prompt(readings, context)
     path = None
     if _cache_enabled():
         h = hashlib.sha256()

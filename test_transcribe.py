@@ -89,7 +89,7 @@ def test_dual_job_end_to_end(tmp_path):
         ),
         renders,
         ocr,
-        adjudicate=lambda png, readings: "surprisingly it worked",
+        adjudicate=lambda png, readings, *a: "surprisingly it worked",
     )
     s = transcribe.summarize(job)
     assert s["state"] == "done"
@@ -241,7 +241,7 @@ def test_uncertainty_markers_counted_and_written():
         dict(document="D", path="/D", mode="dual", pages=[1], total_pages=1, workers=1),
         {1: INK},
         lambda png, b: "anne wrote" if b == "anthropic" else "Anna wrote",
-        adjudicate=lambda png, readings: "{Anna|anne} wrote notes",
+        adjudicate=lambda png, readings, *a: "{Anna|anne} wrote notes",
     )
     s = transcribe.summarize(job)
     assert s["pages_with_uncertainty_markers"] == [1]
@@ -306,7 +306,7 @@ def test_finnish_transcript_labels(monkeypatch):
         dict(document="D", path="/D", mode="dual", pages=[1], total_pages=1, workers=1),
         {1: INK},
         lambda png, b: "a" if b == "anthropic" else "b",
-        adjudicate=lambda png, readings: "{a|b}",
+        adjudicate=lambda png, readings, *a: "{a|b}",
     )
     md = open(transcribe.summarize(job)["output_markdown"], encoding="utf-8").read()
     assert "## Sivu 1" in md and "Merkinnät:" in md and "1 vaihtoehtolukua" in md
@@ -321,3 +321,65 @@ def test_finished_jobs_are_pruned(monkeypatch):
             lambda png, b: "text",
         )
     assert sum(1 for j in transcribe.list_jobs() if j.finished is not None) <= 3
+
+
+def test_page_context_uses_nearest_read_pages():
+    job = transcribe.Job(
+        id="x", document="D", path="/D", mode="dual", pages=[1, 2, 3, 4], total_pages=4
+    )
+    job.results = {p: transcribe.PageResult(page=p) for p in job.pages}
+    job.results[1].status, job.results[1].final = "done", "Yours, Anna"
+    job.results[1].readings = {"anthropic": "Yours, Arna", "gemini": "Yours, Anna"}
+    job.results[2].status = "blank"
+    job.results[4].status, job.results[4].final = "pending", "after"
+    job.results[4].readings = {"anthropic": "after"}
+    assert transcribe.page_context(job, 3) == {"previous": "Yours, Anna", "next": "after"}
+    assert transcribe.page_context(job, 1) == {"previous": None, "next": "after"}
+
+
+def test_adjudication_gets_neighbour_context_and_judge():
+    seen = []
+
+    def adjudicate(png, readings, timeout, context, judge):
+        seen.append((context, judge))
+        return "final"
+
+    texts = {1: ("Alpha", "Alpha"), 2: ("Beta x", "Beta y"), 3: ("Gamma", "Gamma")}
+    calls = {"n": 0}
+
+    def ocr(png, backend):
+        page = calls["n"] // 2 + 1
+        calls["n"] += 1
+        return texts[page][0 if backend == "anthropic" else 1]
+
+    job, adj = _run(
+        dict(
+            document="D",
+            path="/D",
+            mode="dual",
+            pages=[1, 2, 3],
+            total_pages=3,
+            workers=1,
+            models={"judge": "gemini-4-argon"},
+        ),
+        {1: INK, 2: INK, 3: INK},
+        ocr,
+        adjudicate=adjudicate,
+    )
+    assert adj.call_count == 1
+    assert seen == [({"previous": "Alpha", "next": "Gamma"}, "gemini-4-argon")]
+    s = transcribe.summarize(job)
+    assert s["output_markdown"].endswith("D [judge gemini-4-argon].md")
+
+
+def test_failed_adjudication_keeps_first_reading():
+    def boom(*a):
+        raise RuntimeError("judge down")
+
+    job, _ = _run(
+        dict(document="D", path="/D", mode="dual", pages=[1], total_pages=1, workers=1),
+        {1: INK},
+        lambda png, b: "claude text" if b == "anthropic" else "gemini text",
+        adjudicate=boom,
+    )
+    assert job.results[1].status == "done" and job.results[1].final == "claude text"

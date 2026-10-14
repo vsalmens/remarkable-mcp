@@ -2596,6 +2596,7 @@ async def remarkable_transcribe(
     mode: str = "dual",
     workers: int = 4,
     model: Optional[str] = None,
+    judge: Optional[str] = None,
 ) -> str:
     """
     <usecase>Transcribe a handwritten notebook or PDF annotations in the background.</usecase>
@@ -2652,6 +2653,14 @@ async def remarkable_transcribe(
                     "or a claude-… model with mode anthropic/dual.",
                 )
             models[backend] = model.strip()
+        if judge and judge.strip():
+            if mode != "dual" or llm_ocr.backend_for_model(judge) is None:
+                return make_error(
+                    error_type="invalid_judge",
+                    message=f"Judge '{judge}' needs mode 'dual' and a gemini-… or claude-… id.",
+                    suggestion='Example: judge="gemini-4-argon" with mode="dual".',
+                )
+            models["judge"] = judge.strip()
         missing = [b for b in transcribe.MODES[mode] if not llm_ocr.has_credentials(b)]
         if missing:
             return make_error(

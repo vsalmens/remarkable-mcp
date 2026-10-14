@@ -45,7 +45,9 @@ _JOBS: Dict[str, "Job"] = {}
 @dataclass
 class PageResult:
     page: int
-    status: str = "pending"  # pending | blank | done | failed
+    status: str = (
+        "pending"  # pending | blank | done | failed (pending also = awaiting adjudication)
+    )
     readings: Dict[str, Optional[str]] = field(default_factory=dict)
     final: Optional[str] = None
     agreement: Optional[float] = None
@@ -68,7 +70,8 @@ class Job:
     output_md: Optional[str] = None
     output_json: Optional[str] = None
     task: Optional[asyncio.Task] = None
-    models: Dict[str, str] = field(default_factory=dict)  # backend -> model override
+    # backend -> model override; "judge" -> adjudication model
+    models: Dict[str, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +265,8 @@ _LABELS = {"anthropic": "Claude", "gemini": "Gemini"}
 def write_outputs(job: Job) -> None:
     out = transcript_dir()
     out.mkdir(parents=True, exist_ok=True)
-    base = out / _safe_name(job.path, " + ".join(job.models[b] for b in sorted(job.models)))
+    tags = [f"judge {job.models[b]}" if b == "judge" else job.models[b] for b in sorted(job.models)]
+    base = out / _safe_name(job.path, " + ".join(tags))
     readers = " + ".join(
         _LABELS.get(b, b) + (f" ({job.models[b]})" if b in job.models else "")
         for b in MODES[job.mode]
@@ -342,7 +346,8 @@ def write_outputs(job: Job) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _process_page(job: Job, zip_path: Path, page: int, render, sem) -> None:
+async def _read_page(job: Job, zip_path: Path, page: int, render, sem) -> None:
+    """Phase 1: render, skip blank pages, collect every reader's text."""
     from remarkable_mcp.concurrency import run_blocking
 
     r = job.results[page]
@@ -368,11 +373,10 @@ async def _process_page(job: Job, zip_path: Path, page: int, render, sem) -> Non
             if job.mode == "dual":
                 a, g = r.readings.get("anthropic"), r.readings.get("gemini")
                 r.agreement = agreement(a, g)
+                r.final = a if a is not None else g
                 if a is not None and g is not None and a != g:
-                    final = await run_blocking(llm_ocr.adjudicate_png, png, r.readings)
-                    r.final = final if final else (a or g)
-                else:
-                    r.final = a if a is not None else g
+                    r.status = "pending"  # adjudicated in phase 2
+                    return
             else:
                 r.final = next(iter(answered.values()))
             r.status = "done"
@@ -382,6 +386,46 @@ async def _process_page(job: Job, zip_path: Path, page: int, render, sem) -> Non
             r.error = str(e)
 
 
+def _context_text(r: Optional["PageResult"]) -> Optional[str]:
+    if r is None or r.status not in ("done", "pending"):
+        return None
+    # Prefer the Gemini reading: it is usually the closer read of names and words
+    return r.readings.get("gemini") or r.readings.get("anthropic") or r.final
+
+
+def page_context(job: Job, page: int) -> Dict[str, Optional[str]]:
+    """Text of the nearest non-blank page before and after ``page``."""
+    order = sorted(job.results)
+    i = order.index(page)
+    prev = next((job.results[p] for p in reversed(order[:i]) if job.results[p].final), None)
+    nxt = next((job.results[p] for p in order[i + 1 :] if job.results[p].final), None)
+    return {"previous": _context_text(prev), "next": _context_text(nxt)}
+
+
+async def _adjudicate_page(job: Job, zip_path: Path, page: int, render, sem) -> None:
+    """Phase 2: resolve differing readings against the image and nearby pages."""
+    from remarkable_mcp.concurrency import run_blocking
+
+    r = job.results[page]
+    async with sem:
+        try:
+            png = await run_blocking(render, zip_path, page)
+            final = await run_blocking(
+                llm_ocr.adjudicate_png,
+                png,
+                r.readings,
+                180.0,
+                page_context(job, page),
+                job.models.get("judge"),
+            )
+            if final:
+                r.final = final
+            r.status = "done"
+        except Exception as e:
+            logger.warning("Adjudication of page %s failed: %s", page, e)
+            r.status = "done"  # keep the first reader's text rather than lose the page
+
+
 async def run_job(job: Job, raw_doc: bytes, render, workers: int) -> None:
     tmp = None
     try:
@@ -389,7 +433,9 @@ async def run_job(job: Job, raw_doc: bytes, render, workers: int) -> None:
             f.write(raw_doc)
             tmp = Path(f.name)
         sem = asyncio.Semaphore(max(1, workers))
-        await asyncio.gather(*(_process_page(job, tmp, p, render, sem) for p in job.pages))
+        await asyncio.gather(*(_read_page(job, tmp, p, render, sem) for p in job.pages))
+        pending = [p for p in job.pages if job.results[p].status == "pending"]
+        await asyncio.gather(*(_adjudicate_page(job, tmp, p, render, sem) for p in pending))
         write_outputs(job)
         job.state = "done"
     except Exception as e:

@@ -280,3 +280,24 @@ def test_no_vocabulary_no_hint(tmp_path, monkeypatch):
     monkeypatch.delenv("REMARKABLE_OCR_VOCABULARY", raising=False)
     assert llm_ocr.get_vocabulary() == []
     assert "hint, not a rule" not in llm_ocr.build_adjudication_prompt({"gemini": "a"})
+
+
+def test_adjudication_context_and_judge_model(monkeypatch):
+    readings = {"anthropic": "Arna", "gemini": "Anna"}
+    plain = llm_ocr.build_adjudication_prompt(readings)
+    ctx = {"previous": "Yours, Anna", "next": None}
+    prompt = llm_ocr.build_adjudication_prompt(readings, ctx)
+    assert "Neighbouring pages" not in plain
+    assert "<Previous page>\nYours, Anna" in prompt and "Next page" not in prompt
+    assert llm_ocr.build_adjudication_prompt(readings, {"previous": " ", "next": ""}) == plain
+
+    used = []
+
+    def fake(png, model, prompt, timeout):
+        used.append((model, "Yours, Anna" in prompt))
+        return "Anna"
+
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    with patch.dict(llm_ocr._CALLERS, {"gemini": fake}):
+        assert llm_ocr.adjudicate_png(PNG, readings, context=ctx, model="gemini-4-argon") == "Anna"
+    assert used == [("gemini-4-argon", True)]
