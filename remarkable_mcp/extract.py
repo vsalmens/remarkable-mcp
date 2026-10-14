@@ -2549,13 +2549,21 @@ def find_marked_words(
     per point; ``words`` are PyMuPDF word tuples (x0, y0, x1, y1, text, ...) in
     reading order; ``loops`` are pixel boxes of drawn rings (circled text).
     Returns ``[{"text", "kind"}]`` with kind "underline", "strike",
-    "highlight" or "circle"; a phrase ends where the kind of mark changes.
+    "highlight" or "circle"; a phrase ends where a line gives way to a
+    highlight or ring (or the other way round).
     """
     loops = loops or []
     phrases: list = []
     current: list = []
-    current_kind = None
+    kinds: list = []
     last_index = None
+
+    def close():
+        # Underline and strike-through are both pen lines and often alternate
+        # along one sloping stroke; a phrase takes the kind most of its words have.
+        kind = max(set(kinds), key=kinds.count)
+        phrases.append({"text": _tidy_phrase(" ".join(current)), "kind": kind})
+
     for index, word in enumerate(words):
         x0, y0, x1, y1, text = word[:5]
         height = (y1 - y0) * scale
@@ -2576,14 +2584,18 @@ def find_marked_words(
             kind = "strike" if through >= under else "underline"
         if kind is None:
             continue
-        if current and (index != last_index + 1 or kind != current_kind):
-            phrases.append({"text": _tidy_phrase(" ".join(current)), "kind": current_kind})
-            current = []
+        group = "line" if kind in ("strike", "underline") else kind
+        last_group = None
+        if kinds:
+            last_group = "line" if kinds[-1] in ("strike", "underline") else kinds[-1]
+        if current and (index != last_index + 1 or group != last_group):
+            close()
+            current, kinds = [], []
         current.append(text)
-        current_kind = kind
+        kinds.append(kind)
         last_index = index
     if current:
-        phrases.append({"text": _tidy_phrase(" ".join(current)), "kind": current_kind})
+        close()
     return phrases
 
 
