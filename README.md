@@ -707,12 +707,25 @@ or from a scheduled task.
 `remarkable_transcribe_cancel(job_id)` stops a job or a sync (`"sync-…"`).
 Pages already finished are written out and stay cached.
 
+### Reading transcribed documents
+
+Once a document has a transcript, `remarkable_read` answers from it at once:
+a notebook's pages come back as the transcribed text, and a PDF's annotated
+pages list the marked text and the handwriting per page. The response carries
+`"source": "transcript"`, when it was made, and `transcript_stale: true` when
+the document changed afterwards (`remarkable_transcribe_sync()` updates it).
+A notebook without a transcript that is longer than
+`REMARKABLE_READ_OCR_MAX_PAGES` (default 5) is transcribed in the background
+instead of blocking the call; the response gives the job id.
+
 ### Underlines and highlights on PDFs
 
 On a PDF page with a text layer, words you underlined, circled, struck or
 highlighted with the pen are read from the PDF's own text instead of by OCR,
 so they cost nothing and come out exact. They appear as **Marked in the text**
-for each page, one phrase per run of marked words. Only the ink that is left
+for each page, one phrase per run of marked words, each with how it was marked:
+underlined, struck through, highlighted or circled (`kind` in the JSON:
+`underline`, `strike`, `highlight`, `circle`). Only the ink that is left
 over after the marked words are taken away (margin notes, arrows, handwriting)
 goes to the OCR models; a page with marks only makes no API calls. Each
 connected piece of ink is judged as a whole: long, level, thin lines

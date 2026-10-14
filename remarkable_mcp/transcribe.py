@@ -58,8 +58,9 @@ class PageResult:
     final: Optional[str] = None
     agreement: Optional[float] = None
     error: Optional[str] = None
-    # Printed words the pen marked on a PDF page (from the text layer, no OCR)
-    marked: List[str] = field(default_factory=list)
+    # Printed words the pen marked on a PDF page (from the text layer, no OCR):
+    # [{"text", "kind"}], kind underline | strike | highlight | circle
+    marked: List[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -220,6 +221,11 @@ TRANSCRIPT_LABELS: Dict[str, Dict[str, str]] = {
         "doubtful": "{n} doubtful",
         "suggestions": "{n} suggestions",
         "marked": "Marked in the text",
+        "kind_underline": "underlined",
+        "kind_strike": "struck through",
+        "kind_highlight": "highlighted",
+        "kind_circle": "circled",
+        "handwriting": "Handwriting",
         "illegible": "{n} illegible",
     },
     "fi": {
@@ -248,9 +254,23 @@ TRANSCRIPT_LABELS: Dict[str, Dict[str, str]] = {
         "doubtful": "{n} epävarmaa",
         "suggestions": "{n} ehdotusta",
         "marked": "Merkityt kohdat",
+        "kind_underline": "alleviivattu",
+        "kind_strike": "yliviivattu",
+        "kind_highlight": "korostettu",
+        "kind_circle": "ympyröity",
+        "handwriting": "Käsiala",
         "illegible": "{n} lukukelvotonta",
     },
 }
+
+
+def marked_line(mark, lab: Optional[Dict[str, str]] = None) -> str:
+    """One Markdown list line for a marked phrase: the text and how it was marked."""
+    lab = lab or labels()
+    if isinstance(mark, str):  # transcripts written before marks had a kind
+        return f"- {mark}"
+    kind = lab.get(f"kind_{mark.get('kind')}")
+    return f"- {mark['text']}" + (f" _({kind})_" if kind else "")
 
 
 def labels() -> Dict[str, str]:
@@ -344,7 +364,7 @@ def write_outputs(job: Job) -> None:
             lines += [f"_{lab['failed']}: {r.error}_", ""]
             continue
         if r.marked:
-            lines += [f"_{lab['marked']}:_", ""] + [f"- {m}" for m in r.marked] + [""]
+            lines += [f"_{lab['marked']}:_", ""] + [marked_line(m, lab) for m in r.marked] + [""]
         if not r.final:
             continue
         if job.mode == "dual":
@@ -781,6 +801,46 @@ def record_in_index(job: Job) -> None:
         "output_json": job.output_json,
     }
     save_index(index)
+
+
+def load_transcript(document_id: Optional[str]) -> Optional[dict]:
+    """The latest full transcript of a document from the library index, or None.
+
+    Returns the transcript JSON with the index entry under "_index".
+    """
+    if not document_id:
+        return None
+    entry = load_index().get("documents", {}).get(document_id)
+    if not entry or not entry.get("output_json"):
+        return None
+    try:
+        data = json.loads(Path(entry["output_json"]).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    data["_index"] = entry
+    return data
+
+
+def transcript_page_text(page: dict, lab: Optional[Dict[str, str]] = None) -> str:
+    """A transcript page as text: the marked phrases, then the handwriting."""
+    lab = lab or labels()
+    parts = []
+    if page.get("marked"):
+        parts.append(f"{lab['marked']}:")
+        parts += [marked_line(m, lab) for m in page["marked"]]
+    if page.get("final"):
+        if parts:
+            parts.append(f"{lab['handwriting']}:")
+        parts.append(page["final"])
+    return "\n".join(parts)
+
+
+def running_job_for(document_id: Optional[str]) -> Optional["Job"]:
+    """A job for this document that is still running, if any."""
+    for job in _JOBS.values():
+        if document_id and job.document_id == document_id and job.state == "running":
+            return job
+    return None
 
 
 def plan_sync(documents: List[dict], index: dict) -> dict:

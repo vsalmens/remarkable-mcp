@@ -439,6 +439,74 @@ async def remarkable_read(
         file_type = await run_blocking(get_file_type, client, target_doc)
         archive_bytes: Optional[bytes] = None
 
+        # A finished transcription (remarkable_transcribe / _sync) answers at once:
+        # handwriting and pen marks come from it instead of on-demand OCR.
+        from remarkable_mcp import transcribe as _tr
+
+        transcript = None
+        if content_type in ("text", "annotations"):
+            transcript = await run_blocking(_tr.load_transcript, getattr(target_doc, "ID", None))
+        transcript_meta: dict = {}
+        transcript_hint = ""
+        if transcript is not None:
+            entry = transcript["_index"]
+            stale = bool(transcript.get("modified")) and transcript.get(
+                "modified"
+            ) != _modified_iso(target_doc)
+            transcript_meta = {
+                "source": "transcript",
+                "transcribed": entry.get("transcribed"),
+                "transcript_stale": stale,
+                "transcript_markdown": entry.get("output_markdown"),
+            }
+            transcript_hint = "Handwriting and pen marks come from the saved transcript" + (
+                "; the document changed after it was made - "
+                "remarkable_transcribe_sync() updates it."
+                if stale
+                else "."
+            )
+
+        async def too_long_to_read_now() -> bool:
+            """Whether OCR of the whole notebook could outlast the client's timeout."""
+            limit = int(os.environ.get("REMARKABLE_READ_OCR_MAX_PAGES", "5"))
+            if _tr.running_job_for(getattr(target_doc, "ID", None)):
+                return True
+            try:
+                return await count_archive_pages() > limit
+            except Exception:
+                return False
+
+        async def start_background_transcription() -> str:
+            """No transcript yet: transcribe in the background instead of blocking."""
+            job = _tr.running_job_for(getattr(target_doc, "ID", None))
+            if job is None:
+                try:
+                    job = await _start_transcription(
+                        client,
+                        target_doc,
+                        items_by_id,
+                        pages="all",
+                        mode="dual",
+                        workers=4,
+                        models={},
+                    )
+                except _TranscribeRefused as e:
+                    return e.response()
+            return make_response(
+                {
+                    "document": target_doc.VissibleName,
+                    "path": _apply_root_filter(doc_path),
+                    "file_type": file_type or "notebook",
+                    "content_type": content_type,
+                    "content": "",
+                    "transcription_job": job.id,
+                    "pages": job.total_pages,
+                },
+                f"No transcript of this notebook yet, so it is being transcribed in the "
+                f"background (job {job.id}, a few seconds per page). Follow it with "
+                f"remarkable_transcribe_status('{job.id}') and read again when it is done.",
+            )
+
         async def load_archive() -> bytes:
             nonlocal archive_bytes
             if archive_bytes is None:
@@ -553,7 +621,18 @@ async def remarkable_read(
             # For notebooks (no PDF/EPUB), use page-based pagination
             is_notebook = file_type not in ("pdf", "epub")
 
-            if is_notebook and include_ocr:
+            if is_notebook and transcript is not None:
+                lab = _tr.labels()
+                transcript_pages = transcript.get("pages", {})
+                for number, tp in sorted(transcript_pages.items(), key=lambda kv: int(kv[0])):
+                    text = _tr.transcript_page_text(tp, lab) if tp.get("status") == "done" else ""
+                    if text:
+                        notebook_pages.append(f"[{lab['page']} {number}]\n{text}")
+                if notebook_pages:
+                    ocr_backend_used = "transcript"
+                    content = {"pages": len(transcript_pages)}
+
+            if is_notebook and include_ocr and not notebook_pages:
                 cached = await run_blocking(
                     get_cached_ocr_result,
                     target_doc.ID,
@@ -564,6 +643,15 @@ async def remarkable_read(
                     notebook_pages = cached["handwritten_text"]
                     ocr_backend_used = cached.get("ocr_backend")
                     content = cached
+
+            if (
+                is_notebook
+                and include_ocr
+                and not notebook_pages
+                and transcript is None
+                and await too_long_to_read_now()
+            ):
+                return await start_background_transcription()
 
             if not notebook_pages and is_notebook:
                 raw_doc = await load_archive()
@@ -622,7 +710,24 @@ async def remarkable_read(
                 # need not page through the whole document to find them.
                 annotated_pages = content.get("annotated_pages") or []
                 shown_highlights = set()
-                if annotated_pages:
+                transcribed = {}
+                if transcript is not None:
+                    lab = _tr.labels()
+                    for number, tp in (transcript.get("pages") or {}).items():
+                        text = _tr.transcript_page_text(tp, lab)
+                        if text:
+                            transcribed[int(number)] = text
+                if transcribed:
+                    by_page = {ap["page"]: ap for ap in annotated_pages}
+                    annotation_parts.append("\n--- Annotated pages ---")
+                    for number in sorted(set(by_page) | set(transcribed)):
+                        annotation_parts.append(f"Page {number}:")
+                        for h in (by_page.get(number) or {}).get("highlights") or []:
+                            annotation_parts.append(f"  • {h}")
+                            shown_highlights.add(h)
+                        if number in transcribed:
+                            annotation_parts.append(transcribed[number])
+                elif annotated_pages:
                     annotation_parts.append("\n--- Annotated pages ---")
                     for ap in annotated_pages:
                         marks = []
@@ -650,6 +755,13 @@ async def remarkable_read(
                 if content.get("handwritten_text"):
                     annotation_parts.append("\n--- Handwritten (OCR) ---")
                     annotation_parts.extend(content["handwritten_text"])
+
+                if not transcribed and any(ap.get("has_handwriting") for ap in annotated_pages):
+                    annotation_parts.append(
+                        "(Pen marks are not transcribed yet: "
+                        f"remarkable_transcribe('{target_doc.VissibleName}') reads the "
+                        "underlined or circled text from the PDF and the handwriting by OCR.)"
+                    )
 
                 if annotation_parts:
                     if text_parts and content_type == "text":
@@ -782,7 +894,10 @@ async def remarkable_read(
             if grep_matches:
                 hint_parts.insert(0, f"Found {grep_matches} match(es) for '{grep}'.")
 
-            return make_response(result, " ".join(hint_parts))
+            result.update(transcript_meta)
+            return make_response(
+                result, " ".join(x for x in (" ".join(hint_parts), transcript_hint) if x)
+            )
 
         # Combine all content
         full_text = "\n\n".join(text_parts) if text_parts else ""
@@ -826,6 +941,8 @@ async def remarkable_read(
 
         # Handle empty content case - auto-retry with OCR if not already enabled
         if total_chars == 0 and not include_ocr and file_type not in ("pdf", "epub"):
+            if transcript is None and await too_long_to_read_now():
+                return await start_background_transcription()
             # Auto-retry with OCR for notebooks
             import json
 
@@ -871,14 +988,23 @@ async def remarkable_read(
                     target_doc.ModifiedClient if hasattr(target_doc, "ModifiedClient") else None
                 ),
             }
-            hint = (
-                f"Document '{target_doc.VissibleName}' has no extractable text content. "
-                "This may be a handwritten notebook - try include_ocr=True for OCR extraction."
-            )
+            if file_type in ("pdf", "epub") and content_type == "annotations":
+                hint = f"'{target_doc.VissibleName}' has no annotations."
+            elif file_type in ("pdf", "epub"):
+                hint = (
+                    f"'{target_doc.VissibleName}' has no text layer (probably a scanned "
+                    f"{file_type.upper()}) and no annotations."
+                )
+            else:
+                hint = (
+                    f"Document '{target_doc.VissibleName}' has no extractable text content. "
+                    "This may be a handwritten notebook - try include_ocr=True for OCR extraction."
+                )
             if page_count_note:
                 result["page_count_note"] = page_count_note
                 hint = f"{hint} {page_count_note}"
-            return make_response(result, hint)
+            result.update(transcript_meta)
+            return make_response(result, " ".join(x for x in (hint, transcript_hint) if x))
 
         if start_idx >= total_chars:
             # Page out of range
@@ -956,7 +1082,10 @@ async def remarkable_read(
                 "to the cloud; try SSH/USB mode with the device connected."
             )
 
-        return make_response(result, " ".join(hint_parts))
+        result.update(transcript_meta)
+        return make_response(
+            result, " ".join(x for x in (" ".join(hint_parts), transcript_hint) if x)
+        )
 
     except Exception as e:
         return make_error(

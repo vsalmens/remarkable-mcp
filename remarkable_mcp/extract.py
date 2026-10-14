@@ -2539,38 +2539,52 @@ def _column_coverage(mask, box) -> float:
     return inked / (x1 - x0)
 
 
-def find_marked_words(mask, words: list, scale: float, loops: Optional[list] = None) -> list:
+def find_marked_words(
+    mask, words: list, scale: float, loops: Optional[list] = None, highlights=None
+) -> list:
     """Group printed words that carry pen marks into phrases.
 
-    ``mask`` is an 'L' image (255 = ink) of the pen lines and highlights,
-    aligned with the PDF page at ``scale`` pixels per point; ``words`` are
-    PyMuPDF word tuples (x0, y0, x1, y1, text, ...) in reading order; ``loops``
-    are pixel boxes of drawn loops (circled text). Returns the marked phrases.
+    ``mask`` is an 'L' image (255 = ink) of the pen lines and ``highlights``
+    one of the highlighter bands, aligned with the PDF page at ``scale`` pixels
+    per point; ``words`` are PyMuPDF word tuples (x0, y0, x1, y1, text, ...) in
+    reading order; ``loops`` are pixel boxes of drawn rings (circled text).
+    Returns ``[{"text", "kind"}]`` with kind "underline", "strike",
+    "highlight" or "circle"; a phrase ends where the kind of mark changes.
     """
     loops = loops or []
     phrases: list = []
     current: list = []
+    current_kind = None
     last_index = None
     for index, word in enumerate(words):
         x0, y0, x1, y1, text = word[:5]
         height = (y1 - y0) * scale
-        band = (
-            x0 * scale,
-            y0 * scale + MARK_BAND_TOP * height,
-            x1 * scale,
-            y1 * scale + MARK_BAND_BELOW * height,
-        )
-        cx, cy = (x0 + x1) / 2 * scale, (y0 + y1) / 2 * scale
-        circled = any(lx0 <= cx <= lx1 and ly0 <= cy <= ly1 for lx0, ly0, lx1, ly1 in loops)
-        if circled or _column_coverage(mask, band) >= MARK_COVERAGE:
-            if current and last_index is not None and index != last_index + 1:
-                phrases.append(" ".join(current))
-                current = []
-            current.append(text)
-            last_index = index
+        left, right = x0 * scale, x1 * scale
+        top, bottom = y0 * scale, y1 * scale
+        band = (left, top + MARK_BAND_TOP * height, right, bottom + MARK_BAND_BELOW * height)
+        cx, cy = (left + right) / 2, (top + bottom) / 2
+        kind = None
+        if any(lx0 <= cx <= lx1 and ly0 <= cy <= ly1 for lx0, ly0, lx1, ly1 in loops):
+            kind = "circle"
+        elif highlights is not None and _column_coverage(highlights, band) >= MARK_COVERAGE:
+            kind = "highlight"
+        elif _column_coverage(mask, band) >= MARK_COVERAGE:
+            # through the letters or under the baseline (at about 70 % of the box)
+            split = top + 0.7 * height
+            through = _column_coverage(mask, (left, band[1], right, split))
+            under = _column_coverage(mask, (left, split, right, band[3]))
+            kind = "strike" if through >= under else "underline"
+        if kind is None:
+            continue
+        if current and (index != last_index + 1 or kind != current_kind):
+            phrases.append({"text": _tidy_phrase(" ".join(current)), "kind": current_kind})
+            current = []
+        current.append(text)
+        current_kind = kind
+        last_index = index
     if current:
-        phrases.append(" ".join(current))
-    return [_tidy_phrase(p) for p in phrases]
+        phrases.append({"text": _tidy_phrase(" ".join(current)), "kind": current_kind})
+    return phrases
 
 
 def _ink_components(mask) -> list:
@@ -2675,7 +2689,8 @@ def split_pen_marks(mask, words: list, scale: float) -> Tuple[list, Any]:
     per point; ``words`` are the PDF's word tuples. Each connected piece of ink
     is classified as a whole: lines, highlights and rings around printed words
     mark text, everything else is handwriting, even where it is written over
-    the print. Returns the marked phrases and a mask of the handwriting.
+    the print. Returns the marked phrases (see find_marked_words) and a mask
+    of the handwriting.
     """
     from PIL import Image
 
@@ -2685,6 +2700,7 @@ def split_pen_marks(mask, words: list, scale: float) -> Tuple[list, Any]:
     heights = sorted((w[3] - w[1]) * scale for w in words)
     word_height = heights[len(heights) // 2]
     marks = bytearray(len(residual))
+    bands = bytearray(len(residual))
     loops = []
     for piece in _ink_components(mask):
         kind = _classify_ink(piece, word_height, scale, mask.size[0])
@@ -2699,12 +2715,18 @@ def split_pen_marks(mask, words: list, scale: float) -> Tuple[list, Any]:
                 continue  # a ring around no printed word: handwriting
             loops.append(piece["box"])
         else:
+            target = bands if kind == "highlight" else marks
             for i in piece["pixels"]:
-                marks[i] = 255
+                target[i] = 255
         for i in piece["pixels"]:
             residual[i] = 0
-    mark_mask = Image.frombytes("L", mask.size, bytes(marks))
-    phrases = find_marked_words(mark_mask, words, scale, loops)
+    phrases = find_marked_words(
+        Image.frombytes("L", mask.size, bytes(marks)),
+        words,
+        scale,
+        loops,
+        Image.frombytes("L", mask.size, bytes(bands)),
+    )
     return phrases, Image.frombytes("L", mask.size, bytes(residual))
 
 

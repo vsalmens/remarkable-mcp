@@ -8347,3 +8347,99 @@ class TestTypedTextExtraction:
             assert extract_text_from_rm_file(path) == ["Hello world", "Second line"]
         finally:
             path.unlink(missing_ok=True)
+
+
+class TestReadFromTranscript:
+    """remarkable_read answers from a saved transcription instead of OCR."""
+
+    def _setup(self, tmp_path, monkeypatch, modified="2024-01-15T10:30:00Z", pages=None):
+        monkeypatch.setenv("REMARKABLE_TRANSCRIPT_DIR", str(tmp_path))
+        monkeypatch.setenv("REMARKABLE_TRANSCRIPT_LANG", "en")
+        pages = pages or {
+            "1": {"status": "done", "final": "Call Anna about the retreat", "marked": []},
+            "2": {"status": "blank", "final": None, "marked": []},
+        }
+        out = tmp_path / "Notes.json"
+        out.write_text(json.dumps({"document_id": "doc-1", "modified": modified, "pages": pages}))
+        index = {
+            "documents": {
+                "doc-1": {
+                    "document": "Notes",
+                    "modified": modified,
+                    "transcribed": "2024-01-16T09:00:00",
+                    "output_json": str(out),
+                    "output_markdown": str(tmp_path / "Notes.md"),
+                }
+            }
+        }
+        (tmp_path / "_library.json").write_text(json.dumps(index))
+        client = Mock()
+        doc = Mock()
+        doc.VissibleName = "Notes"
+        doc.ID = "doc-1"
+        doc.Parent = ""
+        doc.ModifiedClient = "2024-01-15T10:30:00Z"
+        doc.is_folder = False
+        doc.tags = []
+        client.get_meta_items.return_value = [doc]
+        return client
+
+    @pytest.mark.asyncio
+    async def test_notebook_comes_from_the_transcript(self, tmp_path, monkeypatch):
+        client = self._setup(tmp_path, monkeypatch)
+        with (
+            patch("remarkable_mcp.tools.get_rmapi", return_value=client),
+            patch("remarkable_mcp.tools.get_file_type", return_value="notebook"),
+            patch("remarkable_mcp.tools.extract_text_from_document_zip") as extract,
+        ):
+            result = await _call_tool("remarkable_read", {"document": "Notes"})
+        data = json.loads(result.content[0].text)
+        assert "Call Anna about the retreat" in data["content"]
+        assert data["source"] == "transcript" and data["transcript_stale"] is False
+        assert data["total_pages"] == 2
+        extract.assert_not_called()  # no OCR, no download
+        client.download.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_changed_document_flags_the_transcript_stale(self, tmp_path, monkeypatch):
+        client = self._setup(tmp_path, monkeypatch, modified="2024-01-01T00:00:00Z")
+        with (
+            patch("remarkable_mcp.tools.get_rmapi", return_value=client),
+            patch("remarkable_mcp.tools.get_file_type", return_value="notebook"),
+        ):
+            result = await _call_tool("remarkable_read", {"document": "Notes"})
+        data = json.loads(result.content[0].text)
+        assert data["transcript_stale"] is True
+        assert "remarkable_transcribe_sync" in data["_hint"]
+
+    @pytest.mark.asyncio
+    async def test_pdf_annotations_list_marked_text_and_notes(self, tmp_path, monkeypatch):
+        pages = {
+            "11": {
+                "status": "done",
+                "final": "cf. Bergson",
+                "marked": [{"text": "the vitalist-panpsychistic idea of", "kind": "underline"}],
+            }
+        }
+        client = self._setup(tmp_path, monkeypatch, pages=pages)
+        client.download.return_value = b"PK"
+        content = {
+            "typed_text": [],
+            "highlights": [],
+            "handwritten_text": None,
+            "pages": 20,
+            "annotated_pages": [{"page": 11, "has_handwriting": True, "highlights": []}],
+        }
+        with (
+            patch("remarkable_mcp.tools.get_rmapi", return_value=client),
+            patch("remarkable_mcp.tools.get_file_type", return_value="pdf"),
+            patch("remarkable_mcp.tools.extract_text_from_document_zip", return_value=content),
+        ):
+            result = await _call_tool(
+                "remarkable_read", {"document": "Notes", "content_type": "annotations"}
+            )
+        text = json.loads(result.content[0].text)["content"]
+        assert "Page 11:" in text
+        assert "- the vitalist-panpsychistic idea of _(underlined)_" in text
+        assert "cf. Bergson" in text
+        assert "handwritten notes" not in text

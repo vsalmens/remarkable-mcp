@@ -658,7 +658,7 @@ def test_find_marked_words_groups_phrases():
         (150, 10, 220, 30, "third"),
         (5, 60, 60, 80, "next"),
     ]
-    assert find_marked_words(mask, words, 1.0) == ["first second"]
+    assert find_marked_words(mask, words, 1.0) == [{"text": "first second", "kind": "underline"}]
 
 
 def test_strike_through_marks_only_its_own_line():
@@ -679,7 +679,10 @@ def test_strike_through_marks_only_its_own_line():
         (65, 22, 120, 32, "too"),
         (5, 44, 60, 54, "below"),
     ]
-    assert find_marked_words(mask, words, 1.0) == ["struck words underlined too"]
+    assert find_marked_words(mask, words, 1.0) == [
+        {"text": "struck words", "kind": "strike"},
+        {"text": "underlined too", "kind": "underline"},
+    ]
 
 
 def test_marked_phrases_rejoin_hyphenated_words_and_ligatures():
@@ -692,7 +695,7 @@ def test_marked_phrases_rejoin_hyphenated_words_and_ligatures():
     draw.line((5, 32, 60, 32), fill=255, width=2)
     draw.line((5, 82, 60, 82), fill=255, width=2)
     words = [(5, 10, 60, 30, "promi-"), (5, 60, 60, 80, "nent ﬁndings")]
-    assert find_marked_words(mask, words, 1.0) == ["prominent findings"]
+    assert [m["text"] for m in find_marked_words(mask, words, 1.0)] == ["prominent findings"]
 
 
 def test_pdf_marks_come_from_the_text_layer(tmp_path):
@@ -701,10 +704,12 @@ def test_pdf_marks_come_from_the_text_layer(tmp_path):
     path = _annotated_pdf_zip(tmp_path)
     assert document_has_pdf(path)
     result = analyze_pdf_page_annotations(path, 1)
-    assert result["marked"] == ["efficacy predicts"] and result["text_layer"]
+    assert result["marked"] == [{"text": "efficacy predicts", "kind": "underline"}]
+    assert result["text_layer"]
     assert transcribe.has_ink(result["residual_png"])  # the zigzag, not the underline
     clean = analyze_pdf_page_annotations(_annotated_pdf_zip(tmp_path, scribble=False), 1)
-    assert clean["marked"] == ["efficacy predicts"] and clean["residual_png"] is None
+    assert [m["text"] for m in clean["marked"]] == ["efficacy predicts"]
+    assert clean["residual_png"] is None
 
 
 def test_pdf_job_reads_only_handwriting(tmp_path):
@@ -732,13 +737,17 @@ def test_pdf_job_reads_only_handwriting(tmp_path):
         job = asyncio.run(go())
     assert calls == []  # an underline alone needs no OCR
     r = job.results[1]
-    assert r.status == "done" and r.marked == ["efficacy predicts"] and r.final == ""
+    assert (
+        r.status == "done"
+        and [m["text"] for m in r.marked] == ["efficacy predicts"]
+        and r.final == ""
+    )
     s = transcribe.summarize(job)
     assert s["pages_with_marks"] == [1]
     md = open(s["output_markdown"], encoding="utf-8").read()
     assert "Marked in the text" in md and "- efficacy predicts" in md
     data = json.load(open(s["output_json"], encoding="utf-8"))
-    assert data["pages"]["1"]["marked"] == ["efficacy predicts"]
+    assert [m["text"] for m in data["pages"]["1"]["marked"]] == ["efficacy predicts"]
 
 
 def test_drawing_descriptions_are_not_handwriting():
@@ -774,7 +783,9 @@ def test_pdf_symbols_only_are_not_handwriting(tmp_path, reading):
         patch("remarkable_mcp.llm_ocr.adjudicate_png") as adj,
     ):
         job = asyncio.run(go())
-    assert job.results[1].final == "" and job.results[1].marked == ["efficacy predicts"]
+    assert job.results[1].final == "" and [m["text"] for m in job.results[1].marked] == [
+        "efficacy predicts"
+    ]
     adj.assert_not_called()
 
 
@@ -846,6 +857,10 @@ def test_pen_marks_are_told_apart_from_handwriting_over_the_print():
     font = ImageFont.load_default(size=28)
     draw.text((20, 98), "Orch OR", fill=255, font=font)  # note written over "noted"
     phrases, residual = split_pen_marks(mask, words, 1.0)
-    assert phrases == ["struck phrase", "circled", "glowing"]
+    assert phrases == [
+        {"text": "struck phrase", "kind": "strike"},
+        {"text": "circled", "kind": "circle"},
+        {"text": "glowing", "kind": "highlight"},
+    ]
     left = residual.getbbox()
     assert left is not None and left[1] >= 95 and left[3] <= 135  # only the note is left
