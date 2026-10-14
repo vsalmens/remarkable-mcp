@@ -2682,6 +2682,13 @@ def _tidy_phrase(phrase: str) -> str:
     return re.sub(r"(\w)- (\w)", r"\1\2", phrase)
 
 
+# Classifying ink is pure Python; keep it to a few pages at a time so the
+# server's event loop stays responsive while a large PDF is transcribed.
+_INK_ANALYSIS_SLOTS = threading.Semaphore(2)
+# Ink is classified on a mask this many times smaller than the rendered page.
+_ANALYSIS_REDUCE = 2
+
+
 def split_pen_marks(mask, words: list, scale: float) -> Tuple[list, Any]:
     """Split the ink on a PDF page into marks on the printed text and handwriting.
 
@@ -2690,44 +2697,56 @@ def split_pen_marks(mask, words: list, scale: float) -> Tuple[list, Any]:
     is classified as a whole: lines, highlights and rings around printed words
     mark text, everything else is handwriting, even where it is written over
     the print. Returns the marked phrases (see find_marked_words) and a mask
-    of the handwriting.
+    of the handwriting at full size.
     """
-    from PIL import Image
+    from PIL import Image, ImageChops
 
-    residual = bytearray(mask.tobytes())
     if not words:
         return [], mask
-    heights = sorted((w[3] - w[1]) * scale for w in words)
+    # Work on a smaller copy: a pixel there is ink if any pixel it covers is.
+    reduce = _ANALYSIS_REDUCE if min(mask.size) >= 64 else 1
+    small_size = (max(1, mask.size[0] // reduce), max(1, mask.size[1] // reduce))
+    small = mask.resize(small_size, Image.Resampling.BOX).point(lambda v: 255 if v else 0)
+    small_scale = scale * small_size[0] / mask.size[0]
+    heights = sorted((w[3] - w[1]) * small_scale for w in words)
     word_height = heights[len(heights) // 2]
-    marks = bytearray(len(residual))
-    bands = bytearray(len(residual))
+    marks = bytearray(small_size[0] * small_size[1])
+    bands = bytearray(len(marks))
+    removed = bytearray(len(marks))
     loops = []
-    for piece in _ink_components(mask):
-        kind = _classify_ink(piece, word_height, scale, mask.size[0])
-        if kind is None:
-            continue  # handwriting stays in the residual image
-        if kind == "loop":
-            lx0, ly0, lx1, ly1 = piece["box"]
-            if not any(
-                lx0 <= (w[0] + w[2]) / 2 * scale <= lx1 and ly0 <= (w[1] + w[3]) / 2 * scale <= ly1
-                for w in words
-            ):
-                continue  # a ring around no printed word: handwriting
-            loops.append(piece["box"])
-        else:
-            target = bands if kind == "highlight" else marks
+    with _INK_ANALYSIS_SLOTS:
+        pieces = _ink_components(small)
+        for piece in pieces:
+            kind = _classify_ink(piece, word_height, small_scale, small_size[0])
+            if kind is None:
+                continue  # handwriting stays in the residual image
+            if kind == "loop":
+                lx0, ly0, lx1, ly1 = piece["box"]
+                if not any(
+                    lx0 <= (w[0] + w[2]) / 2 * small_scale <= lx1
+                    and ly0 <= (w[1] + w[3]) / 2 * small_scale <= ly1
+                    for w in words
+                ):
+                    continue  # a ring around no printed word: handwriting
+                loops.append(piece["box"])
+            else:
+                target = bands if kind == "highlight" else marks
+                for i in piece["pixels"]:
+                    target[i] = 255
             for i in piece["pixels"]:
-                target[i] = 255
-        for i in piece["pixels"]:
-            residual[i] = 0
+                removed[i] = 255
     phrases = find_marked_words(
-        Image.frombytes("L", mask.size, bytes(marks)),
+        Image.frombytes("L", small_size, bytes(marks)),
         words,
-        scale,
+        small_scale,
         loops,
-        Image.frombytes("L", mask.size, bytes(bands)),
+        Image.frombytes("L", small_size, bytes(bands)),
     )
-    return phrases, Image.frombytes("L", mask.size, bytes(residual))
+    # Back to full size: drop every full-size pixel whose small pixel was a mark
+    drop = Image.frombytes("L", small_size, bytes(removed)).resize(
+        mask.size, Image.Resampling.NEAREST
+    )
+    return phrases, ImageChops.subtract(mask, drop)
 
 
 def analyze_pdf_page_annotations(
