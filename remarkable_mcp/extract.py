@@ -2697,8 +2697,9 @@ def _tidy_phrase(phrase: str) -> str:
 # Classifying ink is pure Python; keep it to a few pages at a time so the
 # server's event loop stays responsive while a large PDF is transcribed.
 _INK_ANALYSIS_SLOTS = threading.Semaphore(2)
-# Ink is classified on a mask this many times smaller than the rendered page.
-_ANALYSIS_REDUCE = 2
+# Ink is classified on a mask this many times smaller than the rendered page
+# (1 = full resolution: slower on dense pages, but no two strokes merge).
+_ANALYSIS_REDUCE = int(os.environ.get("REMARKABLE_INK_ANALYSIS_REDUCE", "1") or 1)
 
 
 def split_pen_marks(mask, words: list, scale: float) -> Tuple[list, Any]:
