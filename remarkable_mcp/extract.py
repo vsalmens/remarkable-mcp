@@ -49,13 +49,13 @@ REMARKABLE_WIDTH = 1404
 REMARKABLE_HEIGHT = 1872
 
 # PDF points per stroke unit, keyed by the per-page SceneInfo.paper_size grid.
-# The 1404x1872 value was calibrated against a device PDF export. The Paper Pro
-# value follows its panel DPI and remains a best-effort calibration until a
-# ground-truth export reporting that grid is available. Devices that normalize
-# Paper Pro scenes to 1404x1872 continue to use the calibrated value.
+# The 1404x1872 value was calibrated against a device PDF export. Paper Pro
+# scenes (1620x2160 grid) use the same scale: underlines drawn on a Paper Pro
+# land under their words with 0.3177, while the panel-DPI estimate (0.3144)
+# drifted up to half a line too high near the bottom of a Letter page.
 _DEVICE_POINTS_PER_UNIT = {
     (1404, 1872): 0.3177,
-    (1620, 2160): 0.3144,
+    (1620, 2160): 0.3177,
 }
 REMARKABLE_PDF_POINTS_PER_UNIT = 0.3177
 
@@ -81,6 +81,21 @@ def _annotation_page_viewbox(
     view_h = pdf_h_pt / points_per_unit
     view_x = -view_w / 2.0 if centered_x else 0.0
     return view_x, 0.0, view_w, view_h
+
+
+def _pdf_ink_viewbox(pdf_w_pt: float, pdf_h_pt: float, blocks) -> Tuple[float, float, float, float]:
+    """The stroke-space rectangle of a PDF page for one .rm page.
+
+    v6 pages (with blocks) place the page at a fixed scale, centred on x = 0.
+    Older v5 pages (blocks is None) store screen pixels of a 1404x1872 display
+    on which the page was fitted to the screen and centred horizontally.
+    """
+    if blocks is None:
+        fit = min(REMARKABLE_WIDTH / pdf_w_pt, REMARKABLE_HEIGHT / pdf_h_pt)
+        width, height = pdf_w_pt * fit, pdf_h_pt * fit
+        return -(REMARKABLE_WIDTH - width) / 2.0, 0.0, width, height
+    paper_size = _v6_paper_size(blocks)
+    return _annotation_page_viewbox(pdf_w_pt, pdf_h_pt, _points_per_unit(paper_size))
 
 
 def _rewrite_svg_root(
@@ -1843,15 +1858,7 @@ def render_merged_page_from_extracted_document(
             # the root viewBox to the calibrated page rectangle before rasterizing.
             svg_content = ann_svg_path.read_text()
 
-            blocks = _v6_blocks(target_rm_file)
-            paper_size = _v6_paper_size(blocks) if blocks is not None else None
-            points_per_unit = _points_per_unit(paper_size)
-            viewbox = _annotation_page_viewbox(
-                pdf_w_pt,
-                pdf_h_pt,
-                points_per_unit,
-                centered_x=blocks is not None,
-            )
+            viewbox = _pdf_ink_viewbox(pdf_w_pt, pdf_h_pt, _v6_blocks(target_rm_file))
             svg_content = _rewrite_svg_root(
                 svg_content,
                 viewbox=viewbox,
@@ -2560,6 +2567,8 @@ def _word_mark(mask, word, scale, loops, highlights) -> Optional[str]:
     return None
 
 
+# Hyphen, soft hyphen and Unicode hyphen at a line break
+_HYPHENS = ("-", "\u00ad", "\u2010")
 # Unmarked words between two marks of one sentence that are filled in, and
 # how far a sentence may reach around its marks before it is cut to a window.
 MARK_GAP_FILL = 2
@@ -2603,7 +2612,7 @@ def find_marked_words(
         kind = _word_mark(mask, word, scale, loops, highlights)
         if (
             tokens
-            and tokens[-1][0].endswith("-")
+            and tokens[-1][0].endswith(_HYPHENS)
             and tokens[-1][1] == block
             and text[:1].islower()
             and len(tokens[-1][0]) > 1
@@ -2626,6 +2635,8 @@ def find_marked_words(
     passages = []
     for first, last in sentences:
         marked = [i for i in range(first, last) if tokens[i][2]]
+        if len(marked) == 1 and len(tokens[marked[0]][0].strip(".,;:()")) <= 3:
+            marked = []  # a stray touch on one short word ("can", "to")
         if not marked:
             continue
         kinds = [tokens[i][2] for i in marked]
@@ -2945,11 +2956,7 @@ def _analyze_extracted(tmpdir_path: Path, page: int, scale: float) -> Optional[D
         if not _rm_to_svg(rm_file, svg_path):
             return result
         svg_text = svg_path.read_text()
-    blocks = _v6_blocks(rm_file)
-    paper_size = _v6_paper_size(blocks) if blocks is not None else None
-    viewbox = _annotation_page_viewbox(
-        pdf_w, pdf_h, _points_per_unit(paper_size), centered_x=blocks is not None
-    )
+    viewbox = _pdf_ink_viewbox(pdf_w, pdf_h, _v6_blocks(rm_file))
     svg = _rewrite_svg_root(svg_text, viewbox=viewbox, width=out_w, height=out_h)
     ink_png = _svg_string_to_png(svg, out_w, out_h, None)
     if ink_png is None:

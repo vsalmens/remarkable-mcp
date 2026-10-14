@@ -975,3 +975,26 @@ def test_sentence_context_fills_small_gaps_and_knows_abbreviations():
             "kind": "strike",
         }
     ]
+
+
+def test_soft_hyphen_and_stray_short_words():
+    from PIL import Image, ImageDraw
+
+    from remarkable_mcp.extract import find_marked_words
+
+    words = [
+        (10, 10, 60, 30, "conscious", 0, 0, 0),
+        (70, 10, 120, 30, "con­", 0, 0, 1),
+        (10, 40, 60, 60, "tents.", 0, 1, 0),
+        (10, 70, 60, 90, "They", 1, 0, 0),
+        (70, 70, 120, 90, "can", 1, 0, 1),
+        (130, 70, 180, 90, "go.", 1, 0, 2),
+    ]
+    mask = Image.new("L", (200, 100), 0)
+    draw = ImageDraw.Draw(mask)
+    draw.line((70, 31, 120, 31), fill=255, width=2)
+    draw.line((10, 61, 60, 61), fill=255, width=2)
+    draw.line((70, 91, 120, 91), fill=255, width=2)  # only "can": a stray touch
+    assert find_marked_words(mask, words, 1.0) == [
+        {"text": "conscious **contents.**", "marked": "contents.", "kind": "underline"}
+    ]

@@ -177,14 +177,14 @@ def test_device_scale_selection_and_annotation_viewbox():
     paper_pro_ppu = _points_per_unit((1620, 2160))
 
     assert rm2_ppu == pytest.approx(0.3177)
-    assert paper_pro_ppu == pytest.approx(0.3144)
+    assert paper_pro_ppu == pytest.approx(0.3177)  # measured on Paper Pro PDF annotations
     assert _points_per_unit((999, 999)) == pytest.approx(rm2_ppu)
     assert _points_per_unit(None) == pytest.approx(rm2_ppu)
 
     rm2_viewbox = _annotation_page_viewbox(612, 792, rm2_ppu)
     paper_pro_viewbox = _annotation_page_viewbox(612, 792, paper_pro_ppu)
     assert rm2_viewbox[0] == pytest.approx(-rm2_viewbox[2] / 2)
-    assert paper_pro_viewbox[2] > rm2_viewbox[2]
+    assert paper_pro_viewbox[2] == pytest.approx(rm2_viewbox[2])
     assert _annotation_page_viewbox(612, 792, rm2_ppu, centered_x=False)[0] == 0
 
 
@@ -348,3 +348,15 @@ def test_mapped_pdf_fallback_does_not_invent_underlay_for_user_added_page():
         render_pdf.assert_not_called()
     finally:
         zip_path.unlink(missing_ok=True)
+
+
+def test_v5_pages_fit_the_pdf_to_the_screen():
+    """Legacy .rm v5 strokes are screen pixels of a page fitted to 1404x1872."""
+    from remarkable_mcp.extract import _pdf_ink_viewbox
+
+    x, y, w, h = _pdf_ink_viewbox(595.3, 790.9, None)  # A4-ish: width-limited
+    assert (x, y) == pytest.approx((0, 0)) and w == pytest.approx(1404)
+    assert h == pytest.approx(790.9 * 1404 / 595.3)
+    x, y, w, h = _pdf_ink_viewbox(500, 800, None)  # narrow page: height-limited, centred
+    assert h == pytest.approx(1872) and w == pytest.approx(500 * 1872 / 800)
+    assert x == pytest.approx(-(1404 - w) / 2)
