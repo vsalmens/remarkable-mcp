@@ -713,6 +713,18 @@ up at the next check. A run of more than `REMARKABLE_AUTO_SYNC_MAX_DOCS`
 documents (default 20, such as the very first pass) is left for a manual
 `remarkable_transcribe_sync()`. Off by default.
 
+**Half price for syncs.** Syncs (by hand or automatic) send their Claude
+requests as [Message Batches](https://docs.claude.com/en/docs/build-with-claude/batch-processing),
+which cost half the list price and answer within minutes rather than seconds.
+Requests from all documents of a sync that are being worked on go out together
+once every page is waiting for its answer (or after
+`REMARKABLE_BATCH_MAX_WAIT` seconds, default 120); anything a batch fails to
+answer is asked directly, so no page is lost. A sync then works on 8 documents
+at a time. `remarkable_transcribe` and `remarkable_read` never wait for a
+batch. `batch=False` or `REMARKABLE_BATCH=0` turns it off; job usage lists
+batched tokens as `"<model> (batch)"` and prices them at half. Gemini calls are
+made directly.
+
 `remarkable_transcribe_cancel(job_id)` stops a job or a sync (`"sync-…"`).
 Pages already finished are written out and stay cached.
 

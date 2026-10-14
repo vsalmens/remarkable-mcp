@@ -1189,3 +1189,42 @@ def test_pen_is_named_once_and_again_only_when_it_changes(monkeypatch):
     marks = [{"text": "a **b**", "pen": cal}, {"text": "c **d**", "pen": cal}]
     lines = transcribe.marked_lines(marks)
     assert sum("✒" in line for line in lines) == 1 and lines[-1] == "- c **d**"
+
+
+def test_composed_annotations_are_tidied_whatever_the_model():
+    from remarkable_mcp.extract import checked_annotations
+
+    blocks = [
+        "Table 1 Summary. Skills Outcomes",
+        "Affirmation No evidence Questions Neutral Metaphors Insufficient Homework Probably",
+        "Global states concern profile. Local states are contents.",
+    ]
+    head = {"type": "table", "caption": "Table 1 Summary.", "headers": ["Skills", "Outcomes"]}
+    data = {
+        "items": [
+            {"type": "passage", "quote": "Local states are **contents.**", "symbols": ["circle", "?"]},
+            {"type": "passage", "quote": "Global states concern **profile.**",
+             "note": "[curved vertical line] koke-\nmuksena"},
+            dict(head, rows=[["**Affirmation**", "No evidence"], "…", ["**Homework**", "Probably"]]),
+            dict(head, rows=["…", ["Questions ✎ ?", "Neutral"], "…"], note="4(?)"),
+        ],
+        "unplaced_notes": ["[drawing: ovals]"],
+    }
+    out = checked_annotations(data, blocks)
+    kinds = [i["type"] for i in out["items"]]
+    assert kinds == ["table", "passage", "passage"]  # page order, one table
+    table = out["items"][0]
+    assert [r if r == "…" else r[0] for r in table["rows"]] == [
+        "**Affirmation**", "…", "Questions ✎ ?", "…", "**Homework**"
+    ]
+    assert table["note"] == "4(?)"
+    assert out["items"][1]["note"] == "koke- muksena"
+    assert out["items"][2]["symbols"] == ["?"]
+    assert out["unplaced_notes"] == []
+
+
+def test_composer_pens_written_as_text_are_compared_as_pens():
+    pens = transcribe.PenTracker()
+    assert pens.line("ballpoint, black, 0.84 mm")
+    assert pens.line("ballpoint, black, 0.54 mm") is None  # pressure, not a new pen
+    assert pens.line("ballpoint, red, 0.54 mm")

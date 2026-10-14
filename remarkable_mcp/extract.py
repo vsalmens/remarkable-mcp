@@ -3220,20 +3220,88 @@ def _letters(text: str) -> str:
     return re.sub(r"[\W_]+", "", text).lower()
 
 
+# A reader's description of a drawing ("[curved vertical line]"); not "[?]".
+_INK_DESCRIPTION_RE = re.compile(r"\[(?!\?)[^\]]*\]")
+
+
+def _clean_note(note) -> str:
+    """Handwriting only: drawing descriptions out, the writer's line breaks joined."""
+    if not isinstance(note, str):
+        return ""
+    lines = [line.strip() for line in _INK_DESCRIPTION_RE.sub("", note).splitlines()]
+    return " ".join(line for line in lines if line)
+
+
+def _clean_symbols(symbols) -> list:
+    """The reader's own marks (?, !, ✓, ...); words such as "circle" are not symbols."""
+    out = []
+    for sym in symbols or []:
+        sym = str(sym).strip()
+        if sym and len(sym) <= 3 and not re.search(r"\w", sym) and sym not in out:
+            out.append(sym)
+    return out
+
+
+def _row_key(row) -> str:
+    return _letters(str(row[0]).split("✎")[0].replace("**", "")) if row else ""
+
+
+def _merge_tables(tables: list, page: str) -> dict:
+    """One table from pieces with the same caption, rows in page order, … for gaps."""
+    first = dict(tables[0])
+    adjacent, rows, gap_before, gap_after = set(), {}, set(), set()
+    for table in tables:
+        seq = list(table.get("rows") or [])
+        for i, row in enumerate(seq):
+            if not isinstance(row, list):
+                continue
+            key = _row_key(row)
+            rows.setdefault(key, row)
+            if i == 0 or not isinstance(seq[i - 1], list):
+                if i > 0:
+                    gap_before.add(key)
+            else:
+                adjacent.add((_row_key(seq[i - 1]), key))
+            if i + 1 < len(seq) and not isinstance(seq[i + 1], list):
+                gap_after.add(key)
+    ordered = sorted(rows.items(), key=lambda kv: page.find(kv[0]) if kv[0] else 10**9)
+    merged = []
+    for i, (key, row) in enumerate(ordered):
+        if (i == 0 and key in gap_before) or (i and (ordered[i - 1][0], key) not in adjacent):
+            merged.append("…")
+        merged.append(row)
+    if ordered and ordered[-1][0] in gap_after:
+        merged.append("…")
+    first["rows"] = merged
+    notes = [_clean_note(t.get("note")) for t in tables]
+    first["note"] = "; ".join(n for n in notes if n)
+    first["symbols"] = _clean_symbols(s for t in tables for s in t.get("symbols") or [])
+    return first
+
+
 def checked_annotations(data: Optional[dict], blocks: list) -> Optional[dict]:
     """Keep only annotation items whose printed text is really on the page.
 
     A quote or table cell that cannot be found in the page's text (after
     removing the ** marks, spacing and punctuation) is dropped, so the
-    composed annotations never put words in the author's mouth.
+    composed annotations never put words in the author's mouth. The rest is
+    tidied the same way whichever model composed it: items in reading order,
+    pieces of one table joined, drawing descriptions left out of notes and
+    only real symbols kept.
     """
     if not isinstance(data, dict):
         return None
     page = _letters(" ".join(blocks))
-    items = []
+    placed = []  # (position on the page, item)
+    tables: Dict[str, list] = {}
     for item in data.get("items") or []:
         if not isinstance(item, dict):
             continue
+        item = dict(item)
+        if "symbols" in item:
+            item["symbols"] = _clean_symbols(item.get("symbols"))
+        if "note" in item:
+            item["note"] = _clean_note(item.get("note"))
         if item.get("type") == "table":
             cells = [
                 c
@@ -3247,12 +3315,20 @@ def checked_annotations(data: Optional[dict], blocks: list) -> Optional[dict]:
                 for c in cells + [item.get("caption", "")]
             ]
             if cells and all(w in page for w in words if w):
-                items.append(item)
+                tables.setdefault(_letters(item.get("caption", "")) or str(id(item)), []).append(
+                    item
+                )
         elif item.get("type") == "passage" and isinstance(item.get("quote"), str):
             quote = _letters(item["quote"].replace("**", "").replace("…", " "))
             if quote and quote in page and "**" in item["quote"]:
-                items.append(item)
-    notes = [n for n in data.get("unplaced_notes") or [] if isinstance(n, str) and n.strip()]
+                placed.append((page.find(quote), item))
+    for pieces in tables.values():
+        table = _merge_tables(pieces, page)
+        keys = [_row_key(r) for r in table["rows"] if isinstance(r, list)]
+        placed.append((min((page.find(k) for k in keys if k), default=10**9), table))
+    items = [item for _, item in sorted(placed, key=lambda pair: pair[0])]
+    notes = [_clean_note(n) for n in data.get("unplaced_notes") or []]
+    notes = [n for n in notes if n]
     if not items and not notes:
         return None
     return {"items": items, "unplaced_notes": notes}

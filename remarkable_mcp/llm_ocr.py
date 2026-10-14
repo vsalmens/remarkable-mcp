@@ -54,6 +54,11 @@ LIST_PRICES = {
     "claude-haiku-5-5": (0.10, 0.50),
 }
 
+# Usage of requests sent in a Message Batch is kept under "<model> (batch)"
+# and priced at half the list price.
+BATCH_SUFFIX = " (batch)"
+BATCH_DISCOUNT = 0.5
+
 USAGE_SINK: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
     "remarkable_ocr_usage", default=None
 )
@@ -88,9 +93,11 @@ def estimate_cost(usage: dict) -> Optional[float]:
     prices = _prices()
     total, priced = 0.0, False
     for model, entry in usage.items():
-        if model in prices:
-            pin, pout = prices[model]
-            total += (entry["input_tokens"] * pin + entry["output_tokens"] * pout) / 1e6
+        base = model[: -len(BATCH_SUFFIX)] if model.endswith(BATCH_SUFFIX) else model
+        if base in prices:
+            pin, pout = prices[base]
+            share = BATCH_DISCOUNT if base != model else 1.0
+            total += share * (entry["input_tokens"] * pin + entry["output_tokens"] * pout) / 1e6
             priced = True
     return round(total, 4) if priced else None
 
@@ -275,18 +282,26 @@ def _call_anthropic(png: bytes, model: str, prompt: str, timeout: float) -> Opti
     if workspace:
         # Required when the API key is not scoped to a single workspace
         headers["anthropic-workspace-id"] = workspace
-    resp = _post_with_retry(
-        "https://api.anthropic.com/v1/messages", json=body, headers=headers, timeout=timeout
-    )
-    if resp.status_code != 200:
-        logger.warning(
-            "Anthropic OCR HTTP %s: %s", resp.status_code, " ".join(resp.text[:400].split())
+    from remarkable_mcp import batching
+
+    data, billed = None, model
+    batcher = batching.BATCHER.get()
+    if batcher is not None:  # a library sync: sent with others as a Message Batch
+        data = batcher.request(body)
+        billed = model + BATCH_SUFFIX
+    if data is None:
+        resp = _post_with_retry(
+            "https://api.anthropic.com/v1/messages", json=body, headers=headers, timeout=timeout
         )
-        return None
-    data = resp.json()
+        if resp.status_code != 200:
+            logger.warning(
+                "Anthropic OCR HTTP %s: %s", resp.status_code, " ".join(resp.text[:400].split())
+            )
+            return None
+        data, billed = resp.json(), model
     used = data.get("usage") or {}
     _record_usage(
-        model,
+        billed,
         used.get("input_tokens", 0)
         + used.get("cache_creation_input_tokens", 0)
         + used.get("cache_read_input_tokens", 0),

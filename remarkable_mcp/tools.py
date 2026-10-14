@@ -2772,7 +2772,15 @@ def _page_count_and_ids(raw_doc: bytes):
 
 
 async def _start_transcription(
-    client, target_doc, items_by_id, *, pages: str, mode: str, workers: int, models: dict
+    client,
+    target_doc,
+    items_by_id,
+    *,
+    pages: str,
+    mode: str,
+    workers: int,
+    models: dict,
+    batch: bool = False,
 ):
     """Download a document and start its transcription job (raises _TranscribeRefused)."""
     from remarkable_mcp import transcribe
@@ -2808,6 +2816,7 @@ async def _start_transcription(
         page_ids=page_ids,
         # PDF pages: marked printed text from the text layer, OCR only for handwriting
         annotate=analyze_pdf_page_annotations if has_pdf else None,
+        batch=batch,
     )
 
 
@@ -2949,8 +2958,9 @@ async def remarkable_transcribe_sync(
     dry_run: bool = False,
     folder: Optional[str] = None,
     mode: str = "dual",
-    parallel: int = 2,
+    parallel: Optional[int] = None,
     workers: int = 4,
+    batch: bool = True,
 ) -> str:
     """
     <usecase>Keep transcripts in step with the tablet: transcribe only what changed.</usecase>
@@ -2972,8 +2982,13 @@ async def remarkable_transcribe_sync(
     - dry_run: report the plan without transcribing (default False)
     - folder: limit to one folder, e.g. "/Journal" (default: whole library)
     - mode: "dual" (default), "anthropic" or "gemini"
-    - parallel: documents transcribed at the same time (default 2, max 8)
-    - workers: pages per document in parallel (default 4, max 16)
+    - parallel: documents transcribed at the same time (default 8 with batch, else 2;
+      max 16)
+    - workers: pages per document in parallel without batch (default 4, max 16)
+    - batch: send the Claude requests as Anthropic Message Batches at half the
+      price (default True). Answers take minutes instead of seconds, and a
+      request a batch cannot answer is made directly. REMARKABLE_BATCH=0 turns
+      batches off for every sync.
     </parameters>
     <examples>
     - remarkable_transcribe_sync(dry_run=True)
@@ -2981,7 +2996,7 @@ async def remarkable_transcribe_sync(
     - remarkable_transcribe_sync(folder="/Journal")
     </examples>
     """
-    response, _ = await _sync_library(dry_run, folder, mode, parallel, workers)
+    response, _ = await _sync_library(dry_run, folder, mode, parallel, workers, batch=batch)
     return response
 
 
@@ -3002,18 +3017,22 @@ async def _sync_library(
     dry_run: bool = False,
     folder: Optional[str] = None,
     mode: str = "dual",
-    parallel: int = 2,
+    parallel: Optional[int] = None,
     workers: int = 4,
     settle_seconds: float = 0,
     max_documents: Optional[int] = None,
+    batch: bool = True,
 ):
     """Plan and start a library sync. Returns (response JSON, SyncRun or None).
 
     ``settle_seconds`` leaves out documents modified more recently than that
     (still being written); ``max_documents`` refuses to start a bigger sync.
     """
-    from remarkable_mcp import transcribe
+    from remarkable_mcp import batching, transcribe
 
+    batch = bool(batch) and batching.enabled()
+    if parallel is None:
+        parallel = 8 if batch else 2
     try:
         mode = (mode or "dual").strip().lower()
         if mode not in transcribe.MODES:
@@ -3096,6 +3115,7 @@ async def _sync_library(
                 mode=mode,
                 workers=workers,
                 models={},
+                batch=batch,
             )
 
         run = transcribe.start_sync(
@@ -3103,10 +3123,10 @@ async def _sync_library(
             plan["deleted"],
             plan["unchanged"],
             launch,
-            parallel=max(1, min(8, int(parallel))),
+            parallel=max(1, min(16, int(parallel))),
         )
         return make_response(
-            {"sync_id": run.id, **summary},
+            {"sync_id": run.id, "batch": batch, **summary},
             f"Sync {run.id} started for {len(todo)} document(s). "
             f"Follow it with remarkable_transcribe_status('{run.id}').",
         ), run

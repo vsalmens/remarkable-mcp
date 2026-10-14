@@ -22,6 +22,7 @@ from the tablet stay where they are and are marked "deleted".
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import difflib
 import json
 import logging
@@ -33,7 +34,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from remarkable_mcp import llm_ocr
 
@@ -90,6 +91,8 @@ class Job:
     # PDF pages: callable(source, page) -> {"marked", "residual_png"} or None
     annotate: Optional[Callable] = None
     extracted: Optional[Path] = None  # the document unpacked once, for annotate
+    batch: bool = False  # Claude requests go out as Message Batches (library syncs)
+    batcher: Optional[Any] = None
 
     def page_id(self, page: int) -> Optional[str]:
         return self.page_ids[page - 1] if 0 < page <= len(self.page_ids) else None
@@ -319,8 +322,9 @@ def _pen_parts(pen) -> List[str]:
 
 
 # A pen counts as changed when its tool or colour differs, or its line is at
-# least this many times wider or thinner (pressure alone varies it less).
-PEN_WIDTH_CHANGE = 1.5
+# least this many times wider or thinner (pressure alone varies a ballpoint's
+# line by about half).
+PEN_WIDTH_CHANGE = 2.0
 
 
 class PenTracker:
@@ -330,16 +334,30 @@ class PenTracker:
         self.lab = lab or labels()
         self.last = None
 
+    @staticmethod
+    def _parsed(pen):
+        """A pen as a dict, also when the composer wrote it as 'tool, color, 0.3 mm'."""
+        if not isinstance(pen, str):
+            return pen
+        parts = [p.strip() for p in pen.split(",") if p.strip()]
+        out = {"tool": parts[0] if parts else None, "color": None, "width_mm": None}
+        for part in parts[1:]:
+            m = re.match(r"^~?([\d.]+)\s*mm$", part)
+            if m:
+                out["width_mm"] = float(m.group(1))
+            else:
+                out["color"] = part
+        return out
+
     def changed(self, pen) -> bool:
         if not pen:
             return False
         if self.last is None:
             return True
-        if isinstance(pen, str) or isinstance(self.last, str):
-            return pen != self.last
-        if (pen.get("tool"), pen.get("color")) != (self.last.get("tool"), self.last.get("color")):
+        pen, last = self._parsed(pen), self._parsed(self.last)
+        if (pen.get("tool"), pen.get("color")) != (last.get("tool"), last.get("color")):
             return True
-        a, b = pen.get("width_mm"), self.last.get("width_mm")
+        a, b = pen.get("width_mm"), last.get("width_mm")
         if not a or not b:
             return False
         return max(a, b) / max(min(a, b), 1e-6) >= PEN_WIDTH_CHANGE
@@ -599,6 +617,35 @@ def _has_handwriting(text: str) -> bool:
     return bool(_WORD_RE.search(_DESCRIPTION_RE.sub("", text)))
 
 
+def _llm(job: Job, func, *args):
+    """Run an LLM call in a thread: the batch pool for batched jobs, else the default."""
+    if job.batcher is None:
+        from remarkable_mcp.concurrency import run_blocking
+
+        return run_blocking(func, *args)
+    from remarkable_mcp import batching
+
+    ctx = contextvars.copy_context()
+    return asyncio.get_running_loop().run_in_executor(
+        batching.executor(), lambda: ctx.run(func, *args)
+    )
+
+
+async def _tracked(job: Job, coro):
+    """Run one page's work, counted by the batcher so it knows when a batch is whole."""
+    batcher = job.batcher
+    if batcher is None:
+        return await coro
+    from remarkable_mcp import batching
+
+    batching.BATCHER.set(batcher)  # this page task's context, copied into its calls
+    batcher.enter()
+    try:
+        return await coro
+    finally:
+        batcher.leave()
+
+
 async def _page_image(job: Job, zip_path: Path, page: int, render):
     """The image to read for a page, and the printed words its pen marks cover.
 
@@ -631,7 +678,7 @@ async def _read_page(job: Job, zip_path: Path, page: int, render, sem) -> None:
                 return
             backends = MODES[job.mode]
             texts = await asyncio.gather(
-                *(run_blocking(llm_ocr.ocr_png, png, b, 120.0, job.models.get(b)) for b in backends)
+                *(_llm(job, llm_ocr.ocr_png, png, b, 120.0, job.models.get(b)) for b in backends)
             )
             r.readings = dict(zip(backends, texts))
             answered = {b: t for b, t in r.readings.items() if t is not None}
@@ -681,14 +728,14 @@ def page_context(job: Job, page: int) -> Dict[str, Optional[str]]:
 
 async def _adjudicate_page(job: Job, zip_path: Path, page: int, render, sem) -> None:
     """Phase 2: resolve differing readings against the image and nearby pages."""
-    from remarkable_mcp.concurrency import run_blocking
 
     r = job.results[page]
     llm_ocr.USAGE_SINK.set(job.usage)
     async with sem:
         try:
             png, _ = await _page_image(job, zip_path, page, render)
-            final = await run_blocking(
+            final = await _llm(
+                job,
                 llm_ocr.adjudicate_png,
                 png,
                 r.readings,
@@ -738,7 +785,8 @@ async def _compose_page(job: Job, page: int, sem) -> None:
             inputs = await run_blocking(extract.pdf_page_annotation_inputs, job.extracted, page)
             if inputs is None:
                 return
-            data = await run_blocking(
+            data = await _llm(
+                job,
                 llm_ocr.compose_annotations,
                 inputs["png"],
                 inputs["blocks"],
@@ -766,17 +814,27 @@ async def run_job(job: Job, raw_doc: bytes, render, workers: int) -> None:
             with zipfile.ZipFile(tmp) as zf:
                 zf.extractall(unpacked.name)
             job.extracted = Path(unpacked.name)
+        if job.batch:
+            from remarkable_mcp import batching
+
+            job.batcher = batching.shared()
+            # every page at once: a page waiting for its batch holds no API slot
+            workers = len(job.pages)
         sem = asyncio.Semaphore(max(1, workers))
-        await asyncio.gather(*(_read_page(job, tmp, p, render, sem) for p in job.pages))
+        await asyncio.gather(
+            *(_tracked(job, _read_page(job, tmp, p, render, sem)) for p in job.pages)
+        )
         pending = [p for p in job.pages if job.results[p].status == "pending"]
-        await asyncio.gather(*(_adjudicate_page(job, tmp, p, render, sem) for p in pending))
+        await asyncio.gather(
+            *(_tracked(job, _adjudicate_page(job, tmp, p, render, sem)) for p in pending)
+        )
         if job.extracted is not None and _composing_enabled():
             annotated = [
                 p
                 for p in job.pages
                 if job.results[p].status == "done" and needs_composing(job.results[p])
             ]
-            await asyncio.gather(*(_compose_page(job, p, sem) for p in annotated))
+            await asyncio.gather(*(_tracked(job, _compose_page(job, p, sem)) for p in annotated))
         if any(r.status != "blank" for r in job.results.values()):
             write_outputs(job)  # a document without handwriting leaves no files behind
         job.state = "done"
@@ -823,6 +881,7 @@ def start_job(
     modified: Optional[str] = None,
     page_ids: Optional[List[Optional[str]]] = None,
     annotate: Optional[Callable] = None,
+    batch: bool = False,
 ) -> Job:
     job = Job(
         id=uuid.uuid4().hex[:8],
@@ -836,6 +895,7 @@ def start_job(
         modified=modified,
         page_ids=list(page_ids or []),
         annotate=annotate,
+        batch=batch,
     )
     job.results = {p: PageResult(page=p) for p in pages}
     _JOBS[job.id] = job
