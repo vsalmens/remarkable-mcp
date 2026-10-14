@@ -32,6 +32,7 @@ def _env(monkeypatch, tmp_path):
     monkeypatch.delenv("REMARKABLE_OCR_VOCABULARY", raising=False)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "a")
     monkeypatch.setenv("GEMINI_API_KEY", "g")
+    monkeypatch.setenv("REMARKABLE_VOTE", "0")  # tests that vote turn it on
 
 
 def test_parse_pages():
@@ -1244,3 +1245,49 @@ def test_composer_notes_must_come_from_the_readers():
     blocks = ["Global states concern profile. Local states are contents."]
     out = checked_annotations(data, blocks, "[oval]\norch OR\nHameroff")
     assert [i.get("note") for i in out["items"]] == ["Orch OR Hameroff", ""]
+
+
+def test_blind_vote_settles_only_what_both_readers_pick(monkeypatch):
+    import json as _json
+    import re as _re
+
+    monkeypatch.setenv("REMARKABLE_VOTE", "1")
+    from remarkable_mcp import llm_ocr
+
+    prompts = {}
+
+    def voter(name, wanted):
+        def call(png, model, prompt, timeout):
+            prompts[name] = prompt
+            answers = {}
+            for line in prompt.split("Options:")[1].splitlines():
+                m = _re.match(r"^(\d+): (.*)$", line)
+                if m:
+                    opts = dict(_re.findall(r"([ABC]) = (\S+)", m.group(2)))
+                    pick = wanted[int(m.group(1)) - 1]
+                    answers[m.group(1)] = next((k for k, v in opts.items() if v == pick), "?")
+            return _json.dumps(answers)
+
+        return call
+
+    text = "{manipulaatiota|riimijuekaatsota}? ja {Ohto|siskon} sekä {kissa|kassa}"
+    monkeypatch.setitem(
+        llm_ocr._CALLERS, "anthropic", voter("a", ["manipulaatiota", "Ohto", "kissa"])
+    )
+    monkeypatch.setitem(
+        llm_ocr._CALLERS, "gemini", voter("g", ["manipulaatiota", "Ohto", "kassa"])
+    )
+    out = llm_ocr.vote_alternatives(b"png", text, printed="deceptive or manipulative")
+    assert out == "manipulaatiota? ja Ohto sekä {kissa|kassa}"
+    # blind: no reader names, the spots numbered, the printed passage as a hint
+    assert "Reader" not in prompts["a"] and "⟦1⟧" in prompts["a"]
+    assert "deceptive or manipulative" in prompts["g"]
+
+
+def test_vote_keeps_the_options_when_a_reader_fails(monkeypatch):
+    monkeypatch.setenv("REMARKABLE_VOTE", "1")
+    from remarkable_mcp import llm_ocr
+
+    monkeypatch.setitem(llm_ocr._CALLERS, "anthropic", lambda *a: '{"1": "A"}')
+    monkeypatch.setitem(llm_ocr._CALLERS, "gemini", lambda *a: None)
+    assert llm_ocr.vote_alternatives(b"png", "{a|b}") == "{a|b}"

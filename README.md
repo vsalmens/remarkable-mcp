@@ -675,6 +675,15 @@ page later re-runs only the new page, not the adjudication of the pages around i
 `judge="gemini-…"` or `judge="claude-…"` picks the model for that final pass in
 one dual job, e.g. to compare judges.
 
+**Blind vote on open readings.** Where the final pass still leaves `{a|b}`, both
+readers look again: each sees the image, the text with the open spots numbered
+and the options in a shuffled order, without knowing which reader proposed
+which. A spot is settled only when both choose the same option; otherwise both
+readings stay. On PDF pages the passages the reader marked are given as a hint
+(a note often names what the passage says), under the same rule as the other
+context: a hint may suggest, never override the strokes. `REMARKABLE_VOTE=0`
+turns the vote off.
+
 **Writer vocabulary.** Names and terms you write often help the final pass pick
 the right reading of a hard word. List them in `~/.remarkable/ocr-vocabulary.txt`
 (one per line or comma-separated, `#` for comments; read on every call, no

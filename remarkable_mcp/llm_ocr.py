@@ -35,6 +35,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 from pathlib import Path
@@ -454,10 +455,30 @@ def get_vocabulary() -> list:
 CONTEXT_CHARS = 2000
 
 
+def _printed_block(printed: Optional[str]) -> str:
+    """The printed passages a PDF page's notes were written beside, as a hint."""
+    printed = (printed or "").strip()
+    if not printed:
+        return ""
+    return (
+        "\n\nThe handwriting was written on a printed page (a PDF). The passages the "
+        "reader marked there are below, for context only; do not transcribe them. A "
+        "note often names or questions what these passages say, so they may suggest a "
+        "word, but never override the strokes: if the context points to a different "
+        "reading than the image shows, keep what the image supports and add the "
+        "context's reading as a visible suggestion: word→suggestion (?).\n"
+        f"<Printed passages>\n{printed[:CONTEXT_CHARS]}\n</Printed passages>"
+    )
+
+
 def _context_block(context: Optional[dict]) -> str:
     """Neighbouring pages, so names and repeated words can be read consistently."""
     if not context:
         return ""
+    printed = _printed_block(context.get("printed"))
+    if printed:
+        rest = {k: v for k, v in context.items() if k != "printed"}
+        return _context_block(rest) + printed
     parts = []
     for key, label in (("previous", "Previous page"), ("next", "Next page")):
         text = (context.get(key) or "").strip()
@@ -719,3 +740,134 @@ def compose_annotations(
     if data is not None and path:
         _cache_put(path, json.dumps(data, ensure_ascii=False))
     return data
+
+
+# ---------------------------------------------------------------------------
+# Blind vote on what the final pass left open
+# ---------------------------------------------------------------------------
+
+VOTE_VERSION = "v1"
+
+# {likelier|other} or {a|b|c}: options the final pass could not settle.
+ALTERNATIVES_RE = re.compile(r"\{([^{}|\n]+(?:\|[^{}|\n]+){1,2})\}")
+
+VOTE_PROMPT = """You see a page of handwriting and its transcription. At some spots \
+the transcription could not decide between readings; each spot is marked ⟦n⟧ in the \
+text and its options are listed below. For each spot, look at the strokes at that place \
+and choose the option they show.
+
+- Judge by the letters: their number, height, loops, dots and crossings.
+- A real word or a name fits better than a string of letters only when the strokes fit \
+it at least as well.
+- Answer "?" when the strokes do not clearly favour one option.
+
+Return JSON only, one entry per spot: {{"1": "A", "2": "?"}}
+
+Transcription:
+{text}
+
+Options:
+{options}{hint}
+"""
+
+
+def _vote_slots(text: str, rng) -> tuple:
+    """The text with each {a|b} replaced by ⟦n⟧, and per spot the shuffled options."""
+    spots = []
+
+    def slot(m):
+        options = [o.strip() for o in m.group(1).split("|")]
+        order = list(range(len(options)))
+        rng.shuffle(order)
+        spots.append((options, order))
+        return f"⟦{len(spots)}⟧"
+
+    return ALTERNATIVES_RE.sub(slot, text), spots
+
+
+def _vote_once(png, backend, model, text, printed, timeout) -> Optional[list]:
+    """One reader's choice per spot (index into the options, or None), cached."""
+    import random
+
+    seed = hashlib.sha256(f"{backend}\0{model}\0{text}".encode()).hexdigest()
+    slotted, spots = _vote_slots(text, random.Random(seed))
+    if not spots:
+        return []
+    letters = "ABC"
+    options = "\n".join(
+        f"{i}: " + "  ".join(f"{letters[k]} = {opts[j]}" for k, j in enumerate(order))
+        for i, (opts, order) in enumerate(spots, 1)
+    )
+    hint = _printed_block(printed)
+    prompt = VOTE_PROMPT.format(text=slotted, options=options, hint=hint)
+    path = None
+    if _cache_enabled():
+        h = hashlib.sha256()
+        h.update(png)
+        h.update(f"\0vote\0{VOTE_VERSION}\0{backend}\0{model}\0".encode())
+        h.update(prompt.encode())
+        digest = h.hexdigest()
+        path = _cache_dir() / "votes" / digest[:2] / f"{digest}.json"
+        raw = _cache_get(path)
+    else:
+        raw = None
+    if raw is None:
+        try:
+            raw = _CALLERS[backend](png, model, prompt, timeout)
+        except Exception as e:
+            logger.warning("Vote by %s failed: %s", backend, e)
+            return None
+        if raw is None:
+            return None
+        if path:
+            _cache_put(path, raw)
+    data = _parse_json_object(raw)
+    if data is None:
+        return None
+    picks = []
+    for i, (opts, order) in enumerate(spots, 1):
+        answer = str(data.get(str(i), "?")).strip().upper()[:1]
+        k = letters.find(answer) if answer else -1
+        picks.append(order[k] if 0 <= k < len(order) else None)
+    return picks
+
+
+def vote_alternatives(
+    png: bytes,
+    text: str,
+    models: Optional[dict] = None,
+    printed: Optional[str] = None,
+    timeout: float = 120.0,
+) -> str:
+    """Settle {a|b} spots that both readers, voting blind, read the same way.
+
+    Each reader sees the image, the text with the open spots numbered and the
+    options in a shuffled order, without knowing who proposed which. A spot is
+    replaced by an option only when every reader chose it; otherwise it stays
+    open. ``models`` maps each backend to its model (None: configured model).
+    REMARKABLE_VOTE=0 turns the vote off.
+    """
+    if os.environ.get("REMARKABLE_VOTE", "1").strip().lower() in ("0", "false", "no", ""):
+        return text
+    if not text or not ALTERNATIVES_RE.search(text):
+        return text
+    models = models or {b: None for b in LLM_OCR_BACKENDS}
+    voters = [b for b in models if b in _CALLERS and has_credentials(b)]
+    if len(voters) < 2:
+        return text
+    picks = [
+        _vote_once(png, b, (models.get(b) or "").strip() or _model_for(b), text, printed, timeout)
+        for b in voters
+    ]
+    if any(p is None for p in picks):
+        return text
+    counter = iter(range(len(picks[0])))
+
+    def settle(m):
+        i = next(counter)
+        choices = {p[i] for p in picks}
+        if len(choices) == 1 and None not in choices:
+            return [o.strip() for o in m.group(1).split("|")][choices.pop()]
+        return m.group(0)
+
+    return ALTERNATIVES_RE.sub(settle, text)

@@ -734,21 +734,41 @@ async def _adjudicate_page(job: Job, zip_path: Path, page: int, render, sem) -> 
     async with sem:
         try:
             png, _ = await _page_image(job, zip_path, page, render)
+            printed = _printed_context(r)
+            context = page_context(job, page)
+            if printed:
+                context["printed"] = printed
             final = await _llm(
                 job,
                 llm_ocr.adjudicate_png,
                 png,
                 r.readings,
                 180.0,
-                page_context(job, page),
+                context,
                 job.models.get("judge"),
             )
             if final:
                 r.final = final
+            if r.final and llm_ocr.ALTERNATIVES_RE.search(r.final):
+                # what the judge left open, both readers vote on blind
+                voters = {b: job.models.get(b) for b in MODES[job.mode]}
+                r.final = await _llm(
+                    job, llm_ocr.vote_alternatives, png, r.final, voters, printed
+                )
             r.status = "done"
         except Exception as e:
             logger.warning("Adjudication of page %s failed: %s", page, e)
             r.status = "done"  # keep the first reader's text rather than lose the page
+
+
+def _printed_context(r: "PageResult") -> Optional[str]:
+    """A PDF page's marked passages as plain text, the context of its notes."""
+    texts = [
+        (m.get("text") or m.get("marked") or "").replace("**", "")
+        for m in r.marked or []
+        if isinstance(m, dict)
+    ]
+    return "\n".join(t for t in texts if t) or None
 
 
 def needs_composing(r: "PageResult") -> bool:
