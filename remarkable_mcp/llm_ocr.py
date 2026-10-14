@@ -438,6 +438,15 @@ def _vocabulary_hint() -> str:
     )
 
 
+def _adjudication_cache_path(png: bytes, backend: str, model: str, prompt: str) -> Path:
+    h = hashlib.sha256()
+    h.update(png)
+    h.update(b"\0adjudicate\0" + ADJUDICATE_VERSION.encode())
+    h.update(b"\0" + backend.encode() + b"\0" + model.encode() + b"\0" + prompt.encode())
+    digest = h.hexdigest()
+    return _cache_dir() / "adjudicated" / digest[:2] / f"{digest}.txt"
+
+
 def adjudicate_png(
     png: bytes,
     readings: dict,
@@ -461,13 +470,16 @@ def adjudicate_png(
     prompt = build_adjudication_prompt(readings, context)
     path = None
     if _cache_enabled():
-        h = hashlib.sha256()
-        h.update(png)
-        h.update(b"\0adjudicate\0" + ADJUDICATE_VERSION.encode())
-        h.update(b"\0" + backend.encode() + b"\0" + model.encode() + b"\0" + prompt.encode())
-        digest = h.hexdigest()
-        path = _cache_dir() / "adjudicated" / digest[:2] / f"{digest}.txt"
+        # The page's own result is keyed without the neighbouring pages, so adding
+        # or removing a page does not re-run the adjudication of its neighbours.
+        path = _adjudication_cache_path(png, backend, model, build_adjudication_prompt(readings))
         cached = _cache_get(path)
+        if cached is None:
+            # Entries written before this key existed included the context.
+            legacy = _adjudication_cache_path(png, backend, model, prompt)
+            cached = _cache_get(legacy)
+            if cached is not None:
+                _cache_put(path, cached)
         if cached is not None:
             return cached
     try:

@@ -307,3 +307,44 @@ def test_context_never_overrides_the_image():
     prompt = llm_ocr.build_adjudication_prompt({"gemini": "a"}, {"previous": "b"})
     assert "never override" in prompt and "word→suggestion (?)" in prompt
     assert "[?: word word word]" in prompt
+
+
+def test_neighbour_changes_do_not_rerun_adjudication(monkeypatch, tmp_path):
+    monkeypatch.setenv("REMARKABLE_OCR_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    readings = {"anthropic": "Arna", "gemini": "Anna"}
+    calls = []
+
+    def fake(png, model, prompt, timeout):
+        calls.append(prompt)
+        return "Anna"
+
+    with patch.dict(llm_ocr._CALLERS, {"gemini": fake}):
+        first = llm_ocr.adjudicate_png(
+            PNG, readings, context={"previous": "A"}, model="gemini-4-argon"
+        )
+        # a page was inserted before this one: different neighbour, same page
+        again = llm_ocr.adjudicate_png(
+            PNG, readings, context={"previous": "B"}, model="gemini-4-argon"
+        )
+        # the page itself was read differently: adjudicate again
+        llm_ocr.adjudicate_png(
+            PNG, {"gemini": "Anne"}, context={"previous": "B"}, model="gemini-4-argon"
+        )
+    assert first == again == "Anna"
+    assert len(calls) == 2 and "<Previous page>\nA" in calls[0]
+
+
+def test_legacy_context_keyed_entry_is_reused(monkeypatch, tmp_path):
+    monkeypatch.setenv("REMARKABLE_OCR_CACHE_DIR", str(tmp_path))
+    readings = {"anthropic": "Arna", "gemini": "Anna"}
+    ctx = {"previous": "A"}
+    model = llm_ocr._model_for("anthropic")
+    legacy = llm_ocr._adjudication_cache_path(
+        PNG, "anthropic", model, llm_ocr.build_adjudication_prompt(readings, ctx)
+    )
+    llm_ocr._cache_put(legacy, "from before")
+    with patch("requests.post") as post:
+        assert llm_ocr.adjudicate_png(PNG, readings, context=ctx) == "from before"
+        assert llm_ocr.adjudicate_png(PNG, readings, context={"next": "Z"}) == "from before"
+    post.assert_not_called()

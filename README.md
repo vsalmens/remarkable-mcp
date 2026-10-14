@@ -670,6 +670,8 @@ output file name then carries the model so the main transcription stays intact.
 **Neighbouring pages.** All pages are read first; the final pass then also sees
 the text of the previous and next page as context (not to be transcribed), so a
 name or signature that is clear on one page helps read it on the next.
+A page's final text is cached without its neighbours, so adding or removing a
+page later re-runs only the new page, not the adjudication of the pages around it.
 `judge="gemini-…"` or `judge="claude-…"` picks the model for that final pass in
 one dual job, e.g. to compare judges.
 
