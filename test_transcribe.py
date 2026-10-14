@@ -1215,8 +1215,10 @@ def test_composed_annotations_are_tidied_whatever_the_model():
     assert kinds == ["table", "passage", "passage"]  # page order, one table
     table = out["items"][0]
     assert [r if r == "…" else r[0] for r in table["rows"]] == [
-        "**Affirmation**", "…", "Questions ✎ ?", "…", "**Homework**"
-    ]
+        "**Affirmation**", "…", "**Homework**", "…", "Questions ✎ ?", "…"
+    ]  # the composer's row order: a table's text layer is often not in row order
+    single = checked_annotations({"items": [dict(head, rows=[["**Homework**", "Probably"], ["**Affirmation**", "No evidence"]])]}, blocks)
+    assert [r[0] for r in single["items"][0]["rows"]] == ["**Homework**", "**Affirmation**"]
     assert table["note"] == "4(?)"
     assert out["items"][1]["note"] == "koke- muksena"
     assert out["items"][2]["symbols"] == ["?"]

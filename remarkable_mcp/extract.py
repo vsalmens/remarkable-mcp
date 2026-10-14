@@ -3247,32 +3247,29 @@ def _row_key(row) -> str:
 
 
 def _merge_tables(tables: list, page: str) -> dict:
-    """One table from pieces with the same caption, rows in page order, … for gaps."""
+    """One table from pieces with the same caption.
+
+    Rows keep the order the composer gave them (a table's text layer is often
+    not in row order); pieces are joined with … between them and rows that
+    appear in more than one piece are kept once.
+    """
     first = dict(tables[0])
-    adjacent, rows, gap_before, gap_after = set(), {}, set(), set()
-    for table in tables:
-        seq = list(table.get("rows") or [])
-        for i, row in enumerate(seq):
-            if not isinstance(row, list):
-                continue
-            key = _row_key(row)
-            rows.setdefault(key, row)
-            if i == 0 or not isinstance(seq[i - 1], list):
-                if i > 0:
-                    gap_before.add(key)
-            else:
-                adjacent.add((_row_key(seq[i - 1]), key))
-            if i + 1 < len(seq) and not isinstance(seq[i + 1], list):
-                gap_after.add(key)
-    ordered = sorted(rows.items(), key=lambda kv: page.find(kv[0]) if kv[0] else 10**9)
-    merged = []
-    for i, (key, row) in enumerate(ordered):
-        if (i == 0 and key in gap_before) or (i and (ordered[i - 1][0], key) not in adjacent):
-            merged.append("…")
-        merged.append(row)
-    if ordered and ordered[-1][0] in gap_after:
-        merged.append("…")
-    first["rows"] = merged
+    if len(tables) > 1:
+        merged, seen = [], set()
+        for table in tables:
+            rows = list(table.get("rows") or [])
+            if merged and merged[-1] != "…" and rows and rows[0] != "…":
+                merged.append("…")
+            for row in rows:
+                if isinstance(row, list):
+                    key = _row_key(row)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                elif merged and merged[-1] == "…":
+                    continue
+                merged.append(row)
+        first["rows"] = merged
     notes = [_clean_note(t.get("note")) for t in tables]
     first["note"] = "; ".join(n for n in notes if n)
     first["symbols"] = _clean_symbols(s for t in tables for s in t.get("symbols") or [])
