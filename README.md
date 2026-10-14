@@ -732,10 +732,13 @@ instead of blocking the call; the response gives the job id.
 On a PDF page with a text layer, words you underlined, circled, struck or
 highlighted with the pen are read from the PDF's own text instead of by OCR,
 so they cost nothing and come out exact. They appear as **Marked in the text**
-for each page, one phrase per run of marked words, each with how it was marked:
-underlined, struck through, highlighted or circled (`kind` in the JSON:
-`underline`, `strike`, `highlight`, `circle`). Only the ink that is left
-over after the marked words are taken away (margin notes, arrows, handwriting)
+for each page: every marked passage in its sentence, the marked words in bold,
+so the line reads on its own (gaps of up to two unmarked words inside a
+sentence count as marked). The JSON also gives the marked words alone and the
+kind of mark (`underline`, `strike`, `highlight`, `circle`). A word counts as
+circled when one piece of ink runs round it on all sides, even when the stroke
+also crosses the text. Only the ink that is left
+over after the marks are taken away (margin notes, arrows, handwriting)
 goes to the OCR models; a page with marks only makes no API calls. Each
 connected piece of ink is judged as a whole: long, level, thin lines
 (underlines, strike-throughs), solid bands (highlights) and rings drawn around

@@ -58,8 +58,8 @@ class PageResult:
     final: Optional[str] = None
     agreement: Optional[float] = None
     error: Optional[str] = None
-    # Printed words the pen marked on a PDF page (from the text layer, no OCR):
-    # [{"text", "kind"}], kind underline | strike | highlight | circle
+    # Passages the pen marked on a PDF page (from the text layer, no OCR):
+    # [{"text": sentence with **marks**, "marked", "kind"}]
     marked: List[dict] = field(default_factory=list)
 
 
@@ -221,10 +221,6 @@ TRANSCRIPT_LABELS: Dict[str, Dict[str, str]] = {
         "doubtful": "{n} doubtful",
         "suggestions": "{n} suggestions",
         "marked": "Marked in the text",
-        "kind_underline": "underlined",
-        "kind_strike": "struck through",
-        "kind_highlight": "highlighted",
-        "kind_circle": "circled",
         "handwriting": "Handwriting",
         "illegible": "{n} illegible",
     },
@@ -254,10 +250,6 @@ TRANSCRIPT_LABELS: Dict[str, Dict[str, str]] = {
         "doubtful": "{n} epävarmaa",
         "suggestions": "{n} ehdotusta",
         "marked": "Merkityt kohdat",
-        "kind_underline": "alleviivattu",
-        "kind_strike": "yliviivattu",
-        "kind_highlight": "korostettu",
-        "kind_circle": "ympyröity",
         "handwriting": "Käsiala",
         "illegible": "{n} lukukelvotonta",
     },
@@ -265,12 +257,10 @@ TRANSCRIPT_LABELS: Dict[str, Dict[str, str]] = {
 
 
 def marked_line(mark, lab: Optional[Dict[str, str]] = None) -> str:
-    """One Markdown list line for a marked phrase: the text and how it was marked."""
-    lab = lab or labels()
-    if isinstance(mark, str):  # transcripts written before marks had a kind
+    """One Markdown list line for a marked passage: its sentence, marks in bold."""
+    if isinstance(mark, str):  # transcripts written before marks had context
         return f"- {mark}"
-    kind = lab.get(f"kind_{mark.get('kind')}")
-    return f"- {mark['text']}" + (f" _({kind})_" if kind else "")
+    return f"- {mark.get('text') or mark.get('marked', '')}"
 
 
 def labels() -> Dict[str, str]:

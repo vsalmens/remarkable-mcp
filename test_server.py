@@ -8418,7 +8418,13 @@ class TestReadFromTranscript:
             "11": {
                 "status": "done",
                 "final": "cf. Bergson",
-                "marked": [{"text": "the vitalist-panpsychistic idea of", "kind": "underline"}],
+                "marked": [
+                    {
+                        "text": "the **vitalist-panpsychistic idea of** emergence",
+                        "marked": "vitalist-panpsychistic idea of",
+                        "kind": "underline",
+                    }
+                ],
             }
         }
         client = self._setup(tmp_path, monkeypatch, pages=pages)
@@ -8440,6 +8446,6 @@ class TestReadFromTranscript:
             )
         text = json.loads(result.content[0].text)["content"]
         assert "Page 11:" in text
-        assert "- the vitalist-panpsychistic idea of _(underlined)_" in text
+        assert "- the **vitalist-panpsychistic idea of** emergence" in text
         assert "cf. Bergson" in text
         assert "handwritten notes" not in text

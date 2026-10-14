@@ -658,7 +658,10 @@ def test_find_marked_words_groups_phrases():
         (150, 10, 220, 30, "third"),
         (5, 60, 60, 80, "next"),
     ]
-    assert find_marked_words(mask, words, 1.0) == [{"text": "first second", "kind": "underline"}]
+    marked = find_marked_words(mask, words, 1.0)
+    assert marked == [
+        {"text": "**first second** third next", "marked": "first second", "kind": "underline"}
+    ]
 
 
 def test_strike_through_marks_only_its_own_line():
@@ -680,7 +683,7 @@ def test_strike_through_marks_only_its_own_line():
         (5, 44, 60, 54, "below"),
     ]
     marked = find_marked_words(mask, words, 1.0)
-    assert [m["text"] for m in marked] == ["struck words underlined too"]
+    assert [m["marked"] for m in marked] == ["struck words underlined too"]
     assert marked[0]["kind"] in ("strike", "underline")
 
 
@@ -694,7 +697,7 @@ def test_marked_phrases_rejoin_hyphenated_words_and_ligatures():
     draw.line((5, 32, 60, 32), fill=255, width=2)
     draw.line((5, 82, 60, 82), fill=255, width=2)
     words = [(5, 10, 60, 30, "promi-"), (5, 60, 60, 80, "nent ﬁndings")]
-    assert [m["text"] for m in find_marked_words(mask, words, 1.0)] == ["prominent findings"]
+    assert [m["marked"] for m in find_marked_words(mask, words, 1.0)] == ["prominent findings"]
 
 
 def test_pdf_marks_come_from_the_text_layer(tmp_path):
@@ -703,11 +706,14 @@ def test_pdf_marks_come_from_the_text_layer(tmp_path):
     path = _annotated_pdf_zip(tmp_path)
     assert document_has_pdf(path)
     result = analyze_pdf_page_annotations(path, 1)
-    assert result["marked"] == [{"text": "efficacy predicts", "kind": "underline"}]
+    assert [(m["marked"], m["kind"]) for m in result["marked"]] == [
+        ("efficacy predicts", "underline")
+    ]
+    assert "**efficacy predicts**" in result["marked"][0]["text"]
     assert result["text_layer"]
     assert transcribe.has_ink(result["residual_png"])  # the zigzag, not the underline
     clean = analyze_pdf_page_annotations(_annotated_pdf_zip(tmp_path, scribble=False), 1)
-    assert [m["text"] for m in clean["marked"]] == ["efficacy predicts"]
+    assert [m["marked"] for m in clean["marked"]] == ["efficacy predicts"]
     assert clean["residual_png"] is None
 
 
@@ -738,15 +744,15 @@ def test_pdf_job_reads_only_handwriting(tmp_path):
     r = job.results[1]
     assert (
         r.status == "done"
-        and [m["text"] for m in r.marked] == ["efficacy predicts"]
+        and [m["marked"] for m in r.marked] == ["efficacy predicts"]
         and r.final == ""
     )
     s = transcribe.summarize(job)
     assert s["pages_with_marks"] == [1]
     md = open(s["output_markdown"], encoding="utf-8").read()
-    assert "Marked in the text" in md and "- efficacy predicts" in md
+    assert "Marked in the text" in md and "**efficacy predicts**" in md
     data = json.load(open(s["output_json"], encoding="utf-8"))
-    assert [m["text"] for m in data["pages"]["1"]["marked"]] == ["efficacy predicts"]
+    assert [m["marked"] for m in data["pages"]["1"]["marked"]] == ["efficacy predicts"]
 
 
 def test_drawing_descriptions_are_not_handwriting():
@@ -782,7 +788,7 @@ def test_pdf_symbols_only_are_not_handwriting(tmp_path, reading):
         patch("remarkable_mcp.llm_ocr.adjudicate_png") as adj,
     ):
         job = asyncio.run(go())
-    assert job.results[1].final == "" and [m["text"] for m in job.results[1].marked] == [
+    assert job.results[1].final == "" and [m["marked"] for m in job.results[1].marked] == [
         "efficacy predicts"
     ]
     adj.assert_not_called()
@@ -843,10 +849,10 @@ def test_pen_marks_are_told_apart_from_handwriting_over_the_print():
     words = [
         (10, 10, 90, 30, "struck", 0, 0, 0),
         (100, 10, 190, 30, "phrase", 0, 0, 1),
-        (10, 60, 90, 80, "plain", 0, 1, 0),
-        (100, 60, 190, 80, "circled", 0, 1, 1),
-        (10, 110, 90, 130, "noted", 0, 2, 0),
-        (100, 110, 190, 130, "glowing", 0, 2, 1),
+        (10, 60, 90, 80, "plain", 1, 0, 0),
+        (100, 60, 190, 80, "circled", 1, 0, 1),
+        (10, 110, 90, 130, "noted", 2, 0, 0),
+        (100, 110, 190, 130, "glowing", 2, 0, 1),
     ]
     mask = Image.new("L", (400, 160), 0)
     draw = ImageDraw.Draw(mask)
@@ -857,9 +863,9 @@ def test_pen_marks_are_told_apart_from_handwriting_over_the_print():
     draw.text((20, 98), "Orch OR", fill=255, font=font)  # note written over "noted"
     phrases, residual = split_pen_marks(mask, words, 1.0)
     assert phrases == [
-        {"text": "struck phrase", "kind": "strike"},
-        {"text": "circled", "kind": "circle"},
-        {"text": "glowing", "kind": "highlight"},
+        {"text": "**struck phrase**", "marked": "struck phrase", "kind": "strike"},
+        {"text": "plain **circled**", "marked": "circled", "kind": "circle"},
+        {"text": "noted **glowing**", "marked": "glowing", "kind": "highlight"},
     ]
     left = residual.getbbox()
     assert left is not None and left[1] >= 95 and left[3] <= 135  # only the note is left
@@ -917,3 +923,55 @@ def test_auto_sync_times_of_day():
     assert times == [(7, 0), (16, 0), (23, 0)]
     assert _seconds_until_next(times, datetime(2026, 10, 14, 16, 28)) == (6 * 60 + 32) * 60
     assert _seconds_until_next(times, datetime(2026, 10, 14, 23, 0, 1)) == 8 * 3600 - 1
+
+
+def test_one_stroke_ring_through_the_text_marks_the_word():
+    from PIL import Image, ImageDraw
+
+    from remarkable_mcp.extract import split_pen_marks
+
+    words = [
+        (10, 60, 90, 80, "Homework", 0, 0, 0),
+        (100, 60, 190, 80, "Demonstrably", 1, 0, 0),
+        (200, 60, 260, 80, "effective", 1, 0, 1),
+    ]
+    mask = Image.new("L", (300, 140), 0)
+    # One stroke: through the words from the left, round the right end, back
+    # over the top, down the left side and under them (as drawn on a table)
+    path = [
+        (98, 70),
+        (262, 70),
+        (272, 60),
+        (262, 52),
+        (98, 52),
+        (90, 62),
+        (92, 80),
+        (100, 88),
+        (262, 88),
+        (270, 80),
+    ]
+    ImageDraw.Draw(mask).line(path, fill=255, width=2, joint="curve")
+    phrases, residual = split_pen_marks(mask, words, 1.0)
+    assert [(p["marked"], p["kind"]) for p in phrases] == [("Demonstrably effective", "circle")]
+    assert residual.getbbox() is None
+
+
+def test_sentence_context_fills_small_gaps_and_knows_abbreviations():
+    from PIL import Image, ImageDraw
+
+    from remarkable_mcp.extract import find_marked_words
+
+    text = "As noted e.g. by Smith the effect was large and stable. Next sentence here."
+    words = [(10 + i * 60, 10, 60 + i * 60, 30, w, 0, 0, i) for i, w in enumerate(text.split())]
+    mask = Image.new("L", (60 * len(words) + 20, 40), 0)
+    draw = ImageDraw.Draw(mask)
+    for i in (5, 6, 8, 9):  # "the effect" … "large and"; "was" between is a gap of one
+        draw.line((10 + i * 60, 20, 60 + i * 60, 20), fill=255, width=2)
+    marked = find_marked_words(mask, words, 1.0)
+    assert marked == [
+        {
+            "text": "As noted e.g. by Smith **the effect was large and** stable.",
+            "marked": "the effect was large and",
+            "kind": "strike",
+        }
+    ]

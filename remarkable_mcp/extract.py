@@ -2539,71 +2539,139 @@ def _column_coverage(mask, box) -> float:
     return inked / (x1 - x0)
 
 
+def _word_mark(mask, word, scale, loops, highlights) -> Optional[str]:
+    """How the pen marked one printed word, or None."""
+    x0, y0, x1, y1 = word[:4]
+    height = (y1 - y0) * scale
+    left, right = x0 * scale, x1 * scale
+    top, bottom = y0 * scale, y1 * scale
+    band = (left, top + MARK_BAND_TOP * height, right, bottom + MARK_BAND_BELOW * height)
+    cx, cy = (left + right) / 2, (top + bottom) / 2
+    if any(lx0 <= cx <= lx1 and ly0 <= cy <= ly1 for lx0, ly0, lx1, ly1 in loops):
+        return "circle"
+    if highlights is not None and _column_coverage(highlights, band) >= MARK_COVERAGE:
+        return "highlight"
+    if _column_coverage(mask, band) >= MARK_COVERAGE:
+        # through the letters or under the baseline (at about 70 % of the box)
+        split = top + 0.7 * height
+        through = _column_coverage(mask, (left, band[1], right, split))
+        under = _column_coverage(mask, (left, split, right, band[3]))
+        return "strike" if through >= under else "underline"
+    return None
+
+
+# Unmarked words between two marks of one sentence that are filled in, and
+# how far a sentence may reach around its marks before it is cut to a window.
+MARK_GAP_FILL = 2
+CONTEXT_MAX_WORDS = 60
+CONTEXT_WINDOW = 15
+_NOT_SENTENCE_END = re.compile(
+    r"^(e\.g|i\.e|et al|cf|vs|etc|p|pp|fig|figs|no|vol|ed|eds|dr|mr|ms|st|ca|approx|[a-z])\.$",
+    re.IGNORECASE,
+)
+
+
+def _ends_sentence(token: str, following: Optional[str]) -> bool:
+    bare = token.rstrip(")]}\"'’”0-9,–-")
+    if not bare.endswith((".", "?", "!")) or _NOT_SENTENCE_END.match(bare.lstrip("([{\"'‘“")):
+        return False
+    return following is None or not following[:1].islower()
+
+
 def find_marked_words(
     mask, words: list, scale: float, loops: Optional[list] = None, highlights=None
 ) -> list:
-    """Group printed words that carry pen marks into phrases.
+    """The marked passages of a page, each in the sentence around it.
 
     ``mask`` is an 'L' image (255 = ink) of the pen lines and ``highlights``
     one of the highlighter bands, aligned with the PDF page at ``scale`` pixels
-    per point; ``words`` are PyMuPDF word tuples (x0, y0, x1, y1, text, ...) in
-    reading order; ``loops`` are pixel boxes of drawn rings (circled text).
-    Returns ``[{"text", "kind"}]`` with kind "underline", "strike",
-    "highlight" or "circle"; a phrase ends where a line gives way to a
-    highlight or ring (or the other way round).
+    per point; ``words`` are PyMuPDF word tuples (x0, y0, x1, y1, text, block,
+    line, word) in reading order; ``loops`` are pixel boxes of rings drawn
+    around words. Returns ``[{"text", "marked", "kind"}]``: the sentence with
+    the marked words in **bold**, the marked words alone, and the mark most of
+    them carry ("underline", "strike", "highlight" or "circle"). Gaps of up to
+    MARK_GAP_FILL unmarked words inside a sentence count as marked.
     """
+    import unicodedata
+
     loops = loops or []
-    phrases: list = []
-    current: list = []
-    kinds: list = []
-    last_index = None
-
-    def close():
-        # Underline and strike-through are both pen lines and often alternate
-        # along one sloping stroke; a phrase takes the kind most of its words have.
-        kind = max(set(kinds), key=kinds.count)
-        phrases.append({"text": _tidy_phrase(" ".join(current)), "kind": kind})
-
-    for index, word in enumerate(words):
-        x0, y0, x1, y1, text = word[:5]
-        height = (y1 - y0) * scale
-        left, right = x0 * scale, x1 * scale
-        top, bottom = y0 * scale, y1 * scale
-        band = (left, top + MARK_BAND_TOP * height, right, bottom + MARK_BAND_BELOW * height)
-        cx, cy = (left + right) / 2, (top + bottom) / 2
-        kind = None
-        if any(lx0 <= cx <= lx1 and ly0 <= cy <= ly1 for lx0, ly0, lx1, ly1 in loops):
-            kind = "circle"
-        elif highlights is not None and _column_coverage(highlights, band) >= MARK_COVERAGE:
-            kind = "highlight"
-        elif _column_coverage(mask, band) >= MARK_COVERAGE:
-            # through the letters or under the baseline (at about 70 % of the box)
-            split = top + 0.7 * height
-            through = _column_coverage(mask, (left, band[1], right, split))
-            under = _column_coverage(mask, (left, split, right, band[3]))
-            kind = "strike" if through >= under else "underline"
-        if kind is None:
+    # Words hyphenated across a line break become one token first.
+    tokens: list = []  # [text, block, kind]
+    for word in words:
+        text = unicodedata.normalize("NFKC", word[4])
+        block = word[5] if len(word) > 5 else 0
+        kind = _word_mark(mask, word, scale, loops, highlights)
+        if (
+            tokens
+            and tokens[-1][0].endswith("-")
+            and tokens[-1][1] == block
+            and text[:1].islower()
+            and len(tokens[-1][0]) > 1
+        ):
+            tokens[-1][0] = tokens[-1][0][:-1] + text
+            tokens[-1][2] = tokens[-1][2] or kind
             continue
-        group = "line" if kind in ("strike", "underline") else kind
-        last_group = None
-        if kinds:
-            last_group = "line" if kinds[-1] in ("strike", "underline") else kinds[-1]
-        if current and (index != last_index + 1 or group != last_group):
-            close()
-            current, kinds = [], []
-        current.append(text)
-        kinds.append(kind)
-        last_index = index
-    if current:
-        close()
-    return phrases
+        tokens.append([text, block, kind])
+    if not any(t[2] for t in tokens):
+        return []
+
+    # Sentences: split at sentence ends and at text-block changes.
+    sentences, start = [], 0
+    for i, token in enumerate(tokens):
+        following = tokens[i + 1] if i + 1 < len(tokens) else None
+        if following is None or following[1] != token[1] or _ends_sentence(token[0], following[0]):
+            sentences.append((start, i + 1))
+            start = i + 1
+
+    passages = []
+    for first, last in sentences:
+        marked = [i for i in range(first, last) if tokens[i][2]]
+        if not marked:
+            continue
+        kinds = [tokens[i][2] for i in marked]
+        flags = {i: bool(tokens[i][2]) for i in range(first, last)}
+        for a, b in zip(marked, marked[1:]):
+            if 1 < b - a <= MARK_GAP_FILL + 1:
+                for i in range(a + 1, b):
+                    flags[i] = True
+        lo, hi = first, last
+        if hi - lo > CONTEXT_MAX_WORDS:
+            lo = max(first, marked[0] - CONTEXT_WINDOW)
+            hi = min(last, marked[-1] + CONTEXT_WINDOW + 1)
+        parts, run, marked_text = [], [], []
+        for i in range(lo, hi):
+            if flags[i]:
+                run.append(tokens[i][0])
+                continue
+            if run:
+                parts.append("**" + " ".join(run) + "**")
+                marked_text.append(" ".join(run))
+                run = []
+            parts.append(tokens[i][0])
+        if run:
+            parts.append("**" + " ".join(run) + "**")
+            marked_text.append(" ".join(run))
+        text = " ".join(parts)
+        if lo > first:
+            text = "… " + text
+        if hi < last:
+            text += " …"
+        passages.append(
+            {
+                "text": text,
+                "marked": " … ".join(marked_text),
+                "kind": max(set(kinds), key=kinds.count),
+            }
+        )
+    return passages
 
 
 def _ink_components(mask) -> list:
     """Connected pieces of ink (8-connected) in a 0/255 'L' mask.
 
-    Each piece is a dict with its pixel indices, its bounding box and the top
-    and bottom row of ink in each of its columns.
+    Each piece is a dict with its pixel indices, its bounding box, the top and
+    bottom row of ink in each of its columns and the left and right end of ink
+    in each of its rows.
     """
     width, height = mask.size
     data = mask.tobytes()
@@ -2616,6 +2684,7 @@ def _ink_components(mask) -> list:
             stack = [pos]
             pixels = []
             columns: Dict[int, list] = {}
+            rows: Dict[int, list] = {}
             while stack:
                 i = stack.pop()
                 pixels.append(i)
@@ -2627,6 +2696,13 @@ def _ink_components(mask) -> list:
                     span[0] = y
                 elif y > span[1]:
                     span[1] = y
+                span = rows.get(y)
+                if span is None:
+                    rows[y] = [x, x]
+                elif x < span[0]:
+                    span[0] = x
+                elif x > span[1]:
+                    span[1] = x
                 for ny in (y - 1, y, y + 1):
                     if ny < 0 or ny >= height:
                         continue
@@ -2642,6 +2718,7 @@ def _ink_components(mask) -> list:
                 {
                     "pixels": pixels,
                     "columns": columns,
+                    "rows": rows,
                     "box": (
                         min(columns),
                         min(s[0] for s in spans),
@@ -2686,20 +2763,49 @@ def _classify_ink(piece: dict, word_height: float, scale: float, width: int) -> 
     return None
 
 
-def _tidy_phrase(phrase: str) -> str:
-    """Undo ligatures and words hyphenated across a line break."""
-    import unicodedata
-
-    phrase = unicodedata.normalize("NFKC", phrase)
-    return re.sub(r"(\w)- (\w)", r"\1\2", phrase)
-
-
 # Classifying ink is pure Python; keep it to a few pages at a time so the
 # server's event loop stays responsive while a large PDF is transcribed.
 _INK_ANALYSIS_SLOTS = threading.Semaphore(2)
 # Ink is classified on a mask this many times smaller than the rendered page
 # (1 = full resolution: slower on dense pages, but no two strokes merge).
 _ANALYSIS_REDUCE = int(os.environ.get("REMARKABLE_INK_ANALYSIS_REDUCE", "1") or 1)
+
+
+def _encircles_words(piece: dict, words: list, scale: float, width: int) -> bool:
+    """Whether a piece of ink runs around a printed word on all four sides.
+
+    A ring drawn in one stroke often crosses the words it circles, so its
+    shape is no guide; what counts is ink of the same piece above, below,
+    left and right of a word's centre. Handwriting written over a word also
+    surrounds it, but most of its ink lies on the word itself, so a piece with
+    much of its ink inside the word's box is not a ring.
+    """
+    px0, py0, px1, py1 = piece["box"]
+    count = len(piece["pixels"])
+    w, h = px1 - px0 + 1, py1 - py0 + 1
+    if count / (w * h) >= 0.25:
+        return False
+    for word in words:
+        x0, y0, x1, y1 = (v * scale for v in word[:4])
+        cx, cy = int((x0 + x1) / 2), int((y0 + y1) / 2)
+        if not (px0 <= x0 + 2 and x1 - 2 <= px1 and py0 <= y0 + 2 and y1 - 2 <= py1):
+            continue
+        column, row = piece["columns"].get(cx), piece["rows"].get(cy)
+        if not column or not row:
+            continue
+        reach = 0.3 * (y1 - y0)
+        if not (column[0] <= cy - reach and column[1] >= cy + reach):
+            continue
+        if not (row[0] <= x0 + 2 and row[1] >= x1 - 2):
+            continue
+        inside = 0
+        for i in piece["pixels"]:
+            y, x = divmod(i, width)
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                inside += 1
+        if inside <= 0.45 * count:
+            return True
+    return False
 
 
 def split_pen_marks(mask, words: list, scale: float) -> Tuple[list, Any]:
@@ -2731,6 +2837,8 @@ def split_pen_marks(mask, words: list, scale: float) -> Tuple[list, Any]:
         pieces = _ink_components(small)
         for piece in pieces:
             kind = _classify_ink(piece, word_height, small_scale, small_size[0])
+            if kind is None and _encircles_words(piece, words, small_scale, small_size[0]):
+                kind = "loop"  # drawn around words, whatever its shape
             if kind is None:
                 continue  # handwriting stays in the residual image
             if kind == "loop":
