@@ -862,6 +862,7 @@ def test_pen_marks_are_told_apart_from_handwriting_over_the_print():
     font = ImageFont.load_default(size=28)
     draw.text((20, 98), "Orch OR", fill=255, font=font)  # note written over "noted"
     phrases, residual = split_pen_marks(mask, words, 1.0)
+    phrases = [{k: v for k, v in p.items() if not k.startswith("_")} for p in phrases]
     assert phrases == [
         {"text": "**struck phrase**", "marked": "struck phrase", "kind": "strike"},
         {"text": "plain **circled**", "marked": "circled", "kind": "circle"},
@@ -1113,3 +1114,54 @@ def test_pdf_job_composes_annotations(tmp_path, monkeypatch):
     assert seen["handwriting"] == "see ch. 2"
     md = open(transcribe.summarize(job)["output_markdown"], encoding="utf-8").read()
     assert "- Self **efficacy predicts** adherence strongly" in md and "  - ✍ see ch. 2" in md
+
+
+def test_marks_name_the_pen_that_drew_them(tmp_path, monkeypatch):
+    from remarkable_mcp.extract import analyze_pdf_page_annotations
+
+    result = analyze_pdf_page_annotations(_annotated_pdf_zip(tmp_path, scribble=False), 1)
+    pen = result["marked"][0]["pen"]
+    assert pen["tool"] == "fineliner" and pen["color"] == "black" and 0.1 < pen["width_mm"] < 1.5
+    monkeypatch.setenv("REMARKABLE_TRANSCRIPT_LANG", "fi")
+    assert transcribe.pen_text({"tool": "calligraphy pen", "color": "black", "width_mm": 0.26}) == (
+        " _(kalligrafiakynä, musta, 0,26 mm)_"
+    )
+    monkeypatch.setenv("REMARKABLE_TRANSCRIPT_LANG", "en")
+    assert transcribe.pen_text("ballpoint, red, 0.5 mm") == " _(ballpoint, red, 0.5 mm)_"
+    assert transcribe.pen_text(None) == ""
+
+
+def test_calligraphy_lines_are_drawn_thin():
+    from types import SimpleNamespace
+
+    from remarkable_mcp.extract import _v6_stroke_width
+
+    points = [SimpleNamespace(width=8, pressure=100)] * 5  # as stored by a Paper Pro
+    assert _v6_stroke_width(21, points, 1.16) < 4  # stroke units; the old rule gave 5
+    assert 5 < _v6_stroke_width(17, points, 2.0) < 6.5  # fineliner, thickness setting 2
+
+
+def test_composing_runs_only_where_geometry_cannot_place_the_marks():
+    r = transcribe.PageResult(page=1, status="done")
+    r.marked = [{"text": "**a b**", "marked": "a b", "kind": "underline"}]
+    assert not transcribe.needs_composing(r)  # lines in running text: already whole sentences
+    r.final = "?"
+    assert transcribe.needs_composing(r)  # a drawn symbol or a note must be placed
+    r.final = ""
+    r.marked = [{"text": "x", "marked": "x", "kind": "circle"}]
+    assert transcribe.needs_composing(r)
+    r.marked = [{"text": "x", "marked": "x", "kind": "underline", "table": True}]
+    assert transcribe.needs_composing(r)
+
+
+def test_table_blocks_are_recognised():
+    from remarkable_mcp.extract import _table_blocks
+
+    row = lambda y, line: [  # noqa: E731
+        (10, y, 60, y + 10, "Method", 3, line, 0),
+        (200, y, 260, y + 10, "Probably", 3, line, 1),
+        (400, y, 460, y + 10, "Neutral", 3, line, 2),
+    ]
+    words = row(10, 0) + row(30, 1) + row(50, 2)
+    words += [(10, 100, 50, 110, "Plain", 4, 0, 0), (55, 100, 90, 110, "prose.", 4, 0, 1)]
+    assert _table_blocks(words) == [(10, 10, 460, 60)]

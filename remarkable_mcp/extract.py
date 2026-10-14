@@ -463,6 +463,44 @@ def _get_svg_content_bounds(svg_path: Path) -> Optional[tuple]:
 CONTENT_PADDING = 20  # Padding around content bounds for SVG viewBox
 
 
+def _v6_stroke_width(tool, points, thickness_scale) -> float:
+    """Average drawn width of a v6 stroke in stroke units, per pen type.
+
+    v6 points store width x4 and pressure 0-255. The formulas follow how each
+    tablet pen draws (after the rmc exporter's pen models): a fineliner has a
+    fixed width set by the thickness setting, the others follow point width
+    and pressure. The old flat rule (0.8 x stored width) drew calligraphy and
+    ballpoint lines about twice as thick as on the tablet.
+    """
+    widths = [getattr(p, "width", 0) for p in points]
+    pressures = [getattr(p, "pressure", 0) for p in points]
+    w = (sum(widths) / len(widths)) / 4.0 if widths else 2.0
+    pr = (sum(pressures) / len(pressures)) / 255.0 if pressures else 0.5
+    return _pen_width(tool, w, pr, thickness_scale)
+
+
+def _pen_width(tool, w: float, pr: float, thickness_scale=None) -> float:
+    """Drawn width in stroke units from point width ``w`` and pressure ``pr`` (0-1)."""
+    ts = float(thickness_scale or 2.0)
+    if tool in (4, 17):  # fineliner
+        base = 1.3 * ts**2.1
+    elif tool in (2, 15):  # ballpoint
+        base = 0.5 + pr + w
+    elif tool == 21:  # calligraphy
+        base = 0.9 * (1 + 1.4 * pr) * w
+    elif tool in (3, 16):  # marker
+        base = 0.9 * w
+    elif tool in (1, 14):  # pencil
+        base = 0.7 * (0.8 * ts + 0.5 * pr) * w
+    elif tool in (7, 13):  # mechanical pencil
+        base = ts**2
+    elif tool in (0, 12):  # paintbrush
+        base = 0.7 * (1 + 1.4 * pr) * w
+    else:
+        base = w
+    return max(0.4, min(base, 12.0))
+
+
 def _svg_from_paths(paths: list, all_coords: list) -> Optional[str]:
     """Build SVG string with viewBox computed from actual content bounds."""
     if not paths or not all_coords:
@@ -540,7 +578,9 @@ def _render_rm_v5_to_svg(rm_file_path: Path) -> Optional[str]:
                     else:
                         stroke_color = STROKE_COLORS.get(color, "black")
                         avg_width = sum(s[2] for s in segments) / len(segments)
-                        stroke_width = max(0.5, min(avg_width * 0.8, 5.0))
+                        avg_pressure = sum(s[3] for s in segments) / len(segments)
+                        # v5 stores width in pixels and pressure as 0-1
+                        stroke_width = _pen_width(pen, avg_width, avg_pressure)
                         opacity = ""
 
                     d = f"M {segments[0][0]:.1f} {segments[0][1]:.1f}"
@@ -551,7 +591,8 @@ def _render_rm_v5_to_svg(rm_file_path: Path) -> Optional[str]:
                         f'<path d="{d}" stroke="{stroke_color}" '
                         f'stroke-width="{stroke_width:.1f}" '
                         f'fill="none" stroke-linecap="round" '
-                        f'stroke-linejoin="round"{opacity}/>'
+                        f'stroke-linejoin="round"{opacity} '
+                        f'data-tool="{pen}" data-color="{color}"/>'
                     )
 
         return _svg_from_paths(paths, all_coords)
@@ -736,12 +777,9 @@ def _v6_paths_from_blocks(blocks: list, anchor_pos: Optional[dict] = None) -> Tu
             stroke_width = max(10.0, min(avg_width * 2.0, 40.0))
             opacity = ' opacity="0.35"'
         else:
-            avg_width = (
-                sum(p.width for p in line.points) / len(line.points)
-                if all(hasattr(p, "width") for p in line.points)
-                else 2.0
+            stroke_width = _v6_stroke_width(
+                tool, line.points, getattr(line, "thickness_scale", None)
             )
-            stroke_width = max(0.5, min(avg_width * 0.8, 5.0))
             opacity = ""
 
         d = f"M {line.points[0].x + dx:.1f} {line.points[0].y + dy:.1f}"
@@ -752,7 +790,7 @@ def _v6_paths_from_blocks(blocks: list, anchor_pos: Optional[dict] = None) -> Tu
             f'<path d="{d}" stroke="{stroke_color}" '
             f'stroke-width="{stroke_width:.1f}" '
             f'fill="none" stroke-linecap="round" '
-            f'stroke-linejoin="round"{opacity}/>'
+            f'stroke-linejoin="round"{opacity} data-tool="{tool}" data-color="{color}"/>'
         )
     return paths, all_coords
 
@@ -2588,7 +2626,12 @@ def _ends_sentence(token: str, following: Optional[str]) -> bool:
 
 
 def find_marked_words(
-    mask, words: list, scale: float, loops: Optional[list] = None, highlights=None
+    mask,
+    words: list,
+    scale: float,
+    loops: Optional[list] = None,
+    highlights=None,
+    with_boxes: bool = False,
 ) -> list:
     """The marked passages of a page, each in the sentence around it.
 
@@ -2605,7 +2648,7 @@ def find_marked_words(
 
     loops = loops or []
     # Words hyphenated across a line break become one token first.
-    tokens: list = []  # [text, block, kind]
+    tokens: list = []  # [text, block, kind, boxes]
     for word in words:
         text = unicodedata.normalize("NFKC", word[4])
         block = word[5] if len(word) > 5 else 0
@@ -2619,8 +2662,9 @@ def find_marked_words(
         ):
             tokens[-1][0] = tokens[-1][0][:-1] + text
             tokens[-1][2] = tokens[-1][2] or kind
+            tokens[-1][3].append(tuple(word[:4]))
             continue
-        tokens.append([text, block, kind])
+        tokens.append([text, block, kind, [tuple(word[:4])]])
     if not any(t[2] for t in tokens):
         return []
 
@@ -2667,13 +2711,14 @@ def find_marked_words(
             text = "… " + text
         if hi < last:
             text += " …"
-        passages.append(
-            {
-                "text": text,
-                "marked": " … ".join(marked_text),
-                "kind": max(set(kinds), key=kinds.count),
-            }
-        )
+        passage = {
+            "text": text,
+            "marked": " … ".join(marked_text),
+            "kind": max(set(kinds), key=kinds.count),
+        }
+        if with_boxes:  # PDF-point boxes of the marked words (to name the pen)
+            passage["_boxes"] = [b for i in range(lo, hi) if flags[i] for b in tokens[i][3]]
+        passages.append(passage)
     return passages
 
 
@@ -2819,6 +2864,145 @@ def _encircles_words(piece: dict, words: list, scale: float, width: int) -> bool
     return False
 
 
+_PEN_NAMES = {
+    0: "paintbrush",
+    12: "paintbrush",
+    1: "pencil",
+    14: "pencil",
+    2: "ballpoint",
+    15: "ballpoint",
+    3: "marker",
+    16: "marker",
+    4: "fineliner",
+    17: "fineliner",
+    5: "highlighter",
+    18: "highlighter",
+    7: "mechanical pencil",
+    13: "mechanical pencil",
+    21: "calligraphy pen",
+    23: "shader",
+}
+_COLOR_NAMES = {
+    0: "black",
+    1: "gray",
+    2: "white",
+    3: "yellow",
+    4: "green",
+    5: "pink",
+    6: "blue",
+    7: "red",
+    8: "gray",
+    9: "yellow",
+    10: "green",
+    11: "cyan",
+    12: "magenta",
+    13: "yellow",
+}
+_PATH_RE = re.compile(
+    r'<path d="([^"]+)"[^>]*?stroke-width="([\d.]+)"[^>]*?data-tool="(\d+)" data-color="(\d+)"'
+)
+
+
+def _svg_strokes(svg_text: str, viewbox, pdf_w: float) -> list:
+    """Pen strokes of a page as (box in PDF points, tool, color, width in mm)."""
+    vx, vy, vw, _vh = viewbox
+    per_unit = pdf_w / vw  # PDF points per stroke unit
+    strokes = []
+    for d, width, tool, color in _PATH_RE.findall(svg_text):
+        numbers = [float(n) for n in re.findall(r"-?\d+(?:\.\d+)?", d)]
+        xs, ys = numbers[0::2], numbers[1::2]
+        if not xs or not ys:
+            continue
+        box = (
+            (min(xs) - vx) * per_unit,
+            (min(ys) - vy) * per_unit,
+            (max(xs) - vx) * per_unit,
+            (max(ys) - vy) * per_unit,
+        )
+        strokes.append((box, int(tool), int(color), float(width) * per_unit * 25.4 / 72))
+    return strokes
+
+
+def _pen_for_boxes(strokes: list, boxes: list) -> Optional[dict]:
+    """The pen that drew the marks on these word boxes: tool, colour, width."""
+    from collections import Counter
+
+    votes: Counter = Counter()
+    widths = []
+    for (sx0, sy0, sx1, sy1), tool, color, width in strokes:
+        for x0, y0, x1, y1 in boxes:
+            pad = 0.6 * (y1 - y0)
+            if sx0 <= x1 and sx1 >= x0 and sy0 <= y1 + pad and sy1 >= y0 - pad:
+                votes[(tool, color)] += 1
+                widths.append(width)
+                break
+    if not votes:
+        return None
+    tool, color = votes.most_common(1)[0][0]
+    widths.sort()
+    return {
+        "tool": _PEN_NAMES.get(tool, f"pen {tool}"),
+        "color": _COLOR_NAMES.get(color, f"colour {color}"),
+        "width_mm": round(widths[len(widths) // 2], 2),
+    }
+
+
+def pen_label(pen: Optional[dict]) -> str:
+    """'calligraphy pen, black, 0.3 mm' for a pen dict, '' for none."""
+    if not pen:
+        return ""
+    width = pen.get("width_mm")
+    return ", ".join(
+        str(x) for x in (pen.get("tool"), pen.get("color"), f"{width} mm" if width else None) if x
+    )
+
+
+def _table_blocks(words: list) -> list:
+    """Boxes of table-like regions: runs of three or more rows split into columns.
+
+    Words are grouped into rows by their vertical position (across text
+    blocks, since table cells are often blocks of their own); a row is split
+    when two or more gaps between its words are wider than twice its height.
+    """
+    rows: list = []
+    for w in sorted(words, key=lambda w: ((w[1] + w[3]) / 2, w[0])):
+        mid, height = (w[1] + w[3]) / 2, w[3] - w[1]
+        if rows and abs(rows[-1]["mid"] - mid) < 0.4 * height:
+            rows[-1]["words"].append(w)
+        else:
+            rows.append({"mid": mid, "words": [w]})
+    regions, run = [], []
+
+    def close():
+        if len(run) >= 3:
+            ws = [w for row in run for w in row]
+            regions.append(
+                (
+                    min(w[0] for w in ws),
+                    min(w[1] for w in ws),
+                    max(w[2] for w in ws),
+                    max(w[3] for w in ws),
+                )
+            )
+
+    for row in rows:
+        ws = sorted(row["words"], key=lambda w: w[0])
+        height = max(w[3] - w[1] for w in ws)
+        gaps = sum(1 for a, b in zip(ws, ws[1:]) if b[0] - a[2] > 2 * height)
+        if gaps >= 2:
+            run.append(ws)
+        else:
+            close()
+            run = []
+    close()
+    return regions
+
+
+def _in_any(box, regions) -> bool:
+    cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+    return any(x0 <= cx <= x1 and y0 <= cy <= y1 for x0, y0, x1, y1 in regions)
+
+
 def split_pen_marks(mask, words: list, scale: float) -> Tuple[list, Any]:
     """Split the ink on a PDF page into marks on the printed text and handwriting.
 
@@ -2873,6 +3057,7 @@ def split_pen_marks(mask, words: list, scale: float) -> Tuple[list, Any]:
         small_scale,
         loops,
         Image.frombytes("L", small_size, bytes(bands)),
+        with_boxes=True,
     )
     # Back to full size: drop every full-size pixel whose small pixel was a mark
     drop = Image.frombytes("L", small_size, bytes(removed)).resize(
@@ -2965,6 +3150,15 @@ def _analyze_extracted(tmpdir_path: Path, page: int, scale: float) -> Optional[D
     ink = Image.open(io.BytesIO(ink_png)).convert("RGBA").getchannel("A")
     mask = ink.point(lambda v: 255 if v > _INK_ALPHA else 0)
     marked, residual = split_pen_marks(mask, words, scale)
+    strokes = _svg_strokes(svg_text, viewbox, pdf_w)
+    tables = _table_blocks(words)
+    for passage in marked:
+        boxes = passage.pop("_boxes", [])
+        pen = _pen_for_boxes(strokes, boxes)
+        if pen:
+            passage["pen"] = pen
+        if any(_in_any(box, tables) for box in boxes):
+            passage["table"] = True
     result["marked"] = marked
     if residual.histogram()[255] >= _RESIDUAL_MIN_PIXELS * scale:
         buf = io.BytesIO()

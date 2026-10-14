@@ -757,9 +757,15 @@ the reader's own symbols set apart as ✎ **?** or ✎ **!**. A vertical line in
 the margin quotes the whole paragraph. Marks in a table come out as the table's
 caption, its headers and only the marked rows, with … for the rows left out.
 Quotes are checked against the PDF's text and anything not found there is
-dropped; the page's full handwriting stays available below. About one call per
-annotated PDF page; `REMARKABLE_COMPOSE_ANNOTATIONS=0` turns it off and
+dropped; the page's full handwriting stays available below. The pass runs only
+where geometry cannot place the marks: pages with handwriting or drawn symbols,
+rings, highlights or marks in a table. Lines under or through running text
+already come out as whole sentences with the pen named (tool, colour, width).
+`REMARKABLE_COMPOSE_ANNOTATIONS=0` turns it off and
 `REMARKABLE_ANNOTATION_MODEL` picks the model.
+
+Ink is drawn with each pen's own width (calligraphy pen, ballpoint, fineliner
+and so on, after the tablet's pen models), so page images match the tablet.
 
 ### Example configuration
 

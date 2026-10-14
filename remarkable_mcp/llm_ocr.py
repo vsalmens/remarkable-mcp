@@ -572,7 +572,7 @@ def adjudicate_png(
 # Annotations on PDF pages: tie marks, notes and symbols to the printed text
 # ---------------------------------------------------------------------------
 
-COMPOSE_VERSION = "c1"
+COMPOSE_VERSION = "c2"
 
 COMPOSE_PROMPT = """You see a printed page (from a PDF) that a reader annotated with a pen: \
 dark ink over the print. You also get (A) the page's printed text from the PDF text layer, \
@@ -597,6 +597,8 @@ written near the reference it comments on. Leave it out when there is none.
 attached to the passage or term they stand next to. Leave it out when there are none.
 - label: a label the reader wrote at the passage, such as I, II, 1 or *1, especially when the \
 same label appears in a note; without brackets. Leave it out when there is none.
+- pen: the pen given in (B) for the mark this passage comes from, copied as is. Leave it out \
+when (B) gives none.
 
 Table: {{"type": "table", "caption": "...", "headers": ["..."], "rows": [["cell", "..."], "…"], \
 "symbols": [], "note": "..."}}
@@ -624,7 +626,23 @@ Every note in (C) appears exactly once, in an item or in unplaced_notes. Return 
 
 def build_compose_prompt(blocks: list, marks: list, handwriting: Optional[str]) -> str:
     block_text = "\n".join(f"[{i + 1}] {b}" for i, b in enumerate(blocks)) or "(none)"
-    mark_text = "\n".join(f"- {m.get('text', m) if isinstance(m, dict) else m}" for m in marks)
+    lines = []
+    for m in marks:
+        if not isinstance(m, dict):
+            lines.append(f"- {m}")
+            continue
+        pen = m.get("pen") or {}
+        pen_text = ", ".join(
+            str(v)
+            for v in (
+                pen.get("tool"),
+                pen.get("color"),
+                pen.get("width_mm") and f"{pen['width_mm']} mm",
+            )
+            if v
+        )
+        lines.append(f"- {m.get('text', '')}" + (f" (pen: {pen_text})" if pen_text else ""))
+    mark_text = "\n".join(lines)
     return COMPOSE_PROMPT.format(
         blocks=block_text,
         marks=mark_text or "(none)",

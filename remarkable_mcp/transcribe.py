@@ -268,7 +268,45 @@ def marked_line(mark, lab: Optional[Dict[str, str]] = None) -> str:
     """One Markdown list line for a marked passage: its sentence, marks in bold."""
     if isinstance(mark, str):  # transcripts written before marks had context
         return f"- {mark}"
-    return f"- {mark.get('text') or mark.get('marked', '')}"
+    return f"- {mark.get('text') or mark.get('marked', '')}{pen_text(mark.get('pen'))}"
+
+
+_PEN_FI = {
+    "calligraphy pen": "kalligrafiakynä",
+    "ballpoint": "kuulakärkikynä",
+    "fineliner": "kuitukynä",
+    "marker": "tussi",
+    "pencil": "lyijykynä",
+    "mechanical pencil": "lyijytäytekynä",
+    "highlighter": "korostuskynä",
+    "paintbrush": "sivellin",
+    "shader": "varjostin",
+    "black": "musta",
+    "gray": "harmaa",
+    "white": "valkoinen",
+    "yellow": "keltainen",
+    "green": "vihreä",
+    "pink": "pinkki",
+    "blue": "sininen",
+    "red": "punainen",
+    "cyan": "syaani",
+    "magenta": "magenta",
+}
+
+
+def pen_text(pen) -> str:
+    """' _(calligraphy pen, black, 0.26 mm)_' in the transcript language, '' for none."""
+    if not pen:
+        return ""
+    if isinstance(pen, str):
+        parts = [p.strip() for p in pen.split(",") if p.strip()]
+    else:
+        width = pen.get("width_mm")
+        parts = [pen.get("tool"), pen.get("color"), f"{width} mm" if width else None]
+        parts = [str(p) for p in parts if p]
+    if os.environ.get("REMARKABLE_TRANSCRIPT_LANG", "en").strip().lower() == "fi":
+        parts = [_PEN_FI.get(p, p.replace(".", ",") if p.endswith(" mm") else p) for p in parts]
+    return f" _({', '.join(parts)})_" if parts else ""
 
 
 def _symbols(symbols) -> str:
@@ -300,7 +338,10 @@ def annotation_lines(ann: dict, lab: Optional[Dict[str, str]] = None) -> List[st
             lines.append("")
             continue
         label = f"**({item['label']})** " if item.get("label") else ""
-        lines.append(f"- {label}{item.get('quote', '')}{_symbols(item.get('symbols'))}")
+        lines.append(
+            f"- {label}{item.get('quote', '')}{_symbols(item.get('symbols'))}"
+            f"{pen_text(item.get('pen'))}"
+        )
         if item.get("note"):
             lines.append(f"  - ✍ {item['note']}")
     notes = ann.get("unplaced_notes") or []
@@ -589,6 +630,24 @@ async def _adjudicate_page(job: Job, zip_path: Path, page: int, render, sem) -> 
             r.status = "done"  # keep the first reader's text rather than lose the page
 
 
+def needs_composing(r: "PageResult") -> bool:
+    """Whether a PDF page's annotations need the composing pass.
+
+    Lines under or through running text already come out as whole sentences
+    with the marks in bold and the pen named, which is what composing would
+    write. The pass is needed only for what geometry cannot place: any
+    handwriting or drawn symbol (a note, ?, !, a margin line), rings,
+    highlights and marks inside tables.
+    """
+    if r.final:
+        return True
+    return any(
+        m.get("table") or m.get("kind") in ("circle", "highlight")
+        for m in r.marked
+        if isinstance(m, dict)
+    )
+
+
 def _composing_enabled() -> bool:
     return os.environ.get("REMARKABLE_COMPOSE_ANNOTATIONS", "1").strip() not in ("0", "false", "")
 
@@ -641,8 +700,7 @@ async def run_job(job: Job, raw_doc: bytes, render, workers: int) -> None:
             annotated = [
                 p
                 for p in job.pages
-                if job.results[p].status == "done"
-                and (job.results[p].marked or job.results[p].final)
+                if job.results[p].status == "done" and needs_composing(job.results[p])
             ]
             await asyncio.gather(*(_compose_page(job, p, sem) for p in annotated))
         if any(r.status != "blank" for r in job.results.values()):
