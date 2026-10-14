@@ -227,11 +227,17 @@ async def test_transcribe_tool_real_render_end_to_end(mock_get_rmapi, tmp_path):
 
 def test_uncertainty_markers_counted_and_written():
     final = "Anna wrote → {Anna|anne} notes\nvan (?) and [?]\n{a|b|c} ok"
-    assert transcribe.uncertainty(final) == {"alternatives": 2, "doubtful": 1, "illegible": 1}
+    assert transcribe.uncertainty(final) == {
+        "alternatives": 2,
+        "doubtful": 1,
+        "suggestions": 0,
+        "illegible": 1,
+    }
     assert transcribe.alternatives(final) == [["Anna", "anne"], ["a", "b", "c"]]
     assert transcribe.uncertainty("set {x} and (note)") == {
         "alternatives": 0,
         "doubtful": 0,
+        "suggestions": 0,
         "illegible": 0,
     }
     assert transcribe.certainty_level(0.95, transcribe.uncertainty("clear")) == "high"
@@ -383,3 +389,24 @@ def test_failed_adjudication_keeps_first_reading():
         adjudicate=boom,
     )
     assert job.results[1].status == "done" and job.results[1].final == "claude text"
+
+
+def test_shared_notation_runs_and_suggestions():
+    text = "met anne→Anna (?) at [?: the old harbour] and {Bruno|∅} said (?) [?]"
+    assert transcribe.uncertainty(text) == {
+        "alternatives": 1,
+        "doubtful": 2,
+        "suggestions": 1,
+        "illegible": 1,
+    }
+    assert transcribe.suggestions(text) == [["anne", "Anna"]]
+    assert transcribe.alternatives(text) == [["Bruno", "∅"]]
+    job, _ = _run(
+        dict(document="D", path="/D", mode="dual", pages=[1], total_pages=1, workers=1),
+        {1: INK},
+        lambda png, b: "anne" if b == "anthropic" else "arne",
+        adjudicate=lambda png, readings, *a: "anne→Anna (?)",
+    )
+    data = json.load(open(transcribe.summarize(job)["output_json"], encoding="utf-8"))
+    assert data["pages"]["1"]["suggestions"] == [["anne", "Anna"]]
+    assert "word→suggestion (?)" in data["notation"]

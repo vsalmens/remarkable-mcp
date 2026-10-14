@@ -130,19 +130,40 @@ def agreement(a: Optional[str], b: Optional[str]) -> Optional[float]:
 
 
 _ALT_RE = re.compile(r"\{[^{}\n|]+(?:\|[^{}\n|]+)+\}")
-_DOUBT_RE = re.compile(r"\(\?\)")
+_SUGGEST_RE = re.compile(r"([^\s→{}|\[\]]+)→([^\s→{}|\[\]]+) \(\?\)")
+_DOUBT_RE = re.compile(r"\(\?\)|\[\?: [^\]\n]+\]")
 _ILLEGIBLE_RE = re.compile(r"\[\?\]")
+
+# Shared notation, also used by speech transcripts. "basis" says where a marker
+# comes from, as in the speech pipeline's word-level JSON.
+NOTATION = {
+    "{a|b}": "two plausible readings, likelier first (basis: reader_disagreement)",
+    "word (?)": "doubtful reading (basis: self_report)",
+    "[?: w1 w2]": "run of doubtful words, best guesses kept (basis: self_report)",
+    "word→suggestion (?)": "image shows word; context or vocabulary suggests another "
+    "(basis: self_report)",
+    "[?]": "illegible",
+}
 
 
 def uncertainty(text: Optional[str]) -> Dict[str, int]:
-    """Count uncertainty markers: {a|b} alternatives, (?) doubts, [?] illegible."""
+    """Count markers: {a|b}, doubts ((?) and [?: …] runs), → suggestions, [?]."""
     if not text:
-        return {"alternatives": 0, "doubtful": 0, "illegible": 0}
+        return {"alternatives": 0, "doubtful": 0, "suggestions": 0, "illegible": 0}
+    suggestions = len(_SUGGEST_RE.findall(text))
     return {
         "alternatives": len(_ALT_RE.findall(text)),
-        "doubtful": len(_DOUBT_RE.findall(text)),
+        "doubtful": len(_DOUBT_RE.findall(text)) - suggestions,
+        "suggestions": suggestions,
         "illegible": len(_ILLEGIBLE_RE.findall(text)),
     }
+
+
+def suggestions(text: Optional[str]) -> List[List[str]]:
+    """The word→suggestion (?) pairs, each as [as written, suggested]."""
+    if not text:
+        return []
+    return [[m.group(1), m.group(2)] for m in _SUGGEST_RE.finditer(text)]
 
 
 def alternatives(text: Optional[str]) -> List[List[str]]:
@@ -163,7 +184,9 @@ TRANSCRIPT_LABELS: Dict[str, Dict[str, str]] = {
         "legend": "Markers",
         "legend_text": (
             "{a|b} = two plausible readings, likelier first; "
-            "word (?) = doubtful reading; [?] = illegible"
+            "word (?) = doubtful reading; [?: …] = doubtful run; "
+            "word→suggestion (?) = image shows word, context suggests another; "
+            "[?] = illegible"
         ),
         "page": "Page",
         "failed": "Transcription failed",
@@ -177,6 +200,7 @@ TRANSCRIPT_LABELS: Dict[str, Dict[str, str]] = {
         "low": "low",
         "alternatives": "{n} alternative readings",
         "doubtful": "{n} doubtful",
+        "suggestions": "{n} suggestions",
         "illegible": "{n} illegible",
     },
     "fi": {
@@ -187,7 +211,9 @@ TRANSCRIPT_LABELS: Dict[str, Dict[str, str]] = {
         "legend": "Merkinnät",
         "legend_text": (
             "{a|b} = kaksi uskottavaa lukua, todennäköisempi ensin; "
-            "sana (?) = epävarma luku; [?] = lukukelvoton"
+            "sana (?) = epävarma luku; [?: …] = epävarma jakso; "
+            "sana→ehdotus (?) = kuvassa sana, konteksti ehdottaa toista; "
+            "[?] = lukukelvoton"
         ),
         "page": "Sivu",
         "failed": "Litterointi epäonnistui",
@@ -201,6 +227,7 @@ TRANSCRIPT_LABELS: Dict[str, Dict[str, str]] = {
         "low": "matala",
         "alternatives": "{n} vaihtoehtolukua",
         "doubtful": "{n} epävarmaa",
+        "suggestions": "{n} ehdotusta",
         "illegible": "{n} lukukelvotonta",
     },
 }
@@ -217,7 +244,12 @@ def certainty_level(agreement_value: Optional[float], counts: Dict[str, int]) ->
     Combines word-level agreement between the two readers with the number of
     uncertainty markers the adjudicator left in the final text.
     """
-    flagged = counts["alternatives"] + counts["doubtful"] + 2 * counts["illegible"]
+    flagged = (
+        counts["alternatives"]
+        + counts["doubtful"]
+        + counts.get("suggestions", 0)
+        + 2 * counts["illegible"]
+    )
     if agreement_value is None:
         return "low" if flagged >= 4 else "moderate" if flagged else "unknown"
     if agreement_value >= 0.9 and flagged <= 1:
@@ -239,7 +271,7 @@ def _uncertainty_line(r: "PageResult") -> str:
         f"{lab['certainty']} {lab.get(level, '?')}",
         f"{lab['agreement']} {_pct(r.agreement)}",
     ]
-    for key in ("alternatives", "doubtful", "illegible"):
+    for key in ("alternatives", "doubtful", "suggestions", "illegible"):
         if c[key]:
             parts.append(lab[key].format(n=c[key]))
     return "_" + ", ".join(parts) + "_"
@@ -317,6 +349,7 @@ def write_outputs(job: Job) -> None:
                 "path": job.path,
                 "mode": job.mode,
                 "models": job.models,
+                "notation": NOTATION,
                 "pages": {
                     str(p): {
                         "status": r.status,
@@ -328,6 +361,7 @@ def write_outputs(job: Job) -> None:
                         if job.mode == "dual" and r.status == "done"
                         else None,
                         "alternatives": alternatives(r.final),
+                        "suggestions": suggestions(r.final),
                         "error": r.error,
                     }
                     for p, r in sorted(job.results.items())

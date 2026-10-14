@@ -649,9 +649,22 @@ agreement between the readers and the text. Markdown and JSON are written to
 Markdown labels are English by default (`REMARKABLE_TRANSCRIPT_LANG=fi` for Finnish).
 Transient API errors are retried (`REMARKABLE_OCR_RETRIES`, default 4).
 
-The final text marks uncertainty inline: `{likelier|other}` for two plausible
-readings, `word (?)` for a doubtful one, `[?]` for illegible text. Pass
-`model="gemini-…"` or `model="claude-…"` to try another model for one job; the
+The final text marks uncertainty inline, in a Jefferson-style notation that
+can be shared with speech transcripts:
+
+| Marker | Meaning |
+| --- | --- |
+| `{likelier\|other}` | two plausible readings, likelier first |
+| `word (?)` | doubtful reading |
+| `[?: w1 w2 w3]` | run of doubtful words, best guesses kept |
+| `word→suggestion (?)` | the image shows *word*; context or vocabulary suggests another |
+| `[?]` | illegible |
+
+Context and vocabulary may suggest but never silently replace what the
+handwriting shows. The JSON output repeats the notation and lists each page's
+`alternatives` and `suggestions`.
+
+Pass `model="gemini-…"` or `model="claude-…"` to try another model for one job; the
 output file name then carries the model so the main transcription stays intact.
 
 **Neighbouring pages.** All pages are read first; the final pass then also sees

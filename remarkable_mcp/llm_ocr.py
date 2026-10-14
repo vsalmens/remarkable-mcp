@@ -323,12 +323,16 @@ def ocr_png_file(png_path: Path, backend: str) -> Optional[str]:
 # Dual reading: resolve disagreements against the image
 # ---------------------------------------------------------------------------
 
-ADJUDICATE_VERSION = "v2"
+ADJUDICATE_VERSION = "v3"
 
-# Uncertainty markup in adjudicated (dual) transcriptions:
-#   {likelier|other}  two (or three) plausible readings, likeliest first
-#   word (?)          a single reading with low confidence
-#   [?]               illegible
+# Uncertainty markup in adjudicated (dual) transcriptions. The same inline
+# notation is used for speech transcripts (Jefferson-style conventions):
+#   {likelier|other}     two (or three) plausible readings, likeliest first
+#   word (?)             a single reading with low confidence
+#   [?: w1 w2 w3]        a run of consecutive doubtful words (best guesses kept)
+#   word→suggestion (?)  the image shows "word"; context or the writer's
+#                        vocabulary suggests "suggestion" (never silently replaced)
+#   [?]                  illegible
 
 
 def _vocabulary_file() -> Path:
@@ -377,7 +381,11 @@ def _context_block(context: Optional[dict]) -> str:
         "\n\nNeighbouring pages of the same notebook, as read by one reader, for "
         "context only. Do not transcribe them. Use them to resolve names, recurring "
         "words and this writer's spelling, e.g. a signature that matches a heading on "
-        "the previous page.\n" + "\n".join(parts)
+        "the previous page. Context may suggest but never override: an unusual word "
+        "or a break in the train of thought may be exactly what the writer meant. If "
+        "the context points to a different reading than the image shows, keep the "
+        "word the image supports and add the context's reading as a visible "
+        "suggestion: word→suggestion (?).\n" + "\n".join(parts)
     )
 
 
@@ -404,6 +412,8 @@ def build_adjudication_prompt(readings: dict, context: Optional[dict] = None) ->
         "readings. At most three options: {a|b|c}. Keep the braces tight around the "
         "differing word(s) only.\n"
         "- A single reading you are unsure of: the word followed by (?).\n"
+        "- Several consecutive words you are unsure of: [?: word word word], keeping "
+        "your best guesses inside.\n"
         "- Wholly illegible: [?].\n"
         "- Where the image clearly shows one reading, write it plainly with no marker, "
         "even if the readers disagreed.\n"
@@ -421,9 +431,10 @@ def _vocabulary_hint() -> str:
     return (
         "Names and terms this writer often uses (a hint, not a rule): "
         + ", ".join(terms)
-        + ". Where the handwriting is compatible with one of these and neither reader "
-        "has it, include it as an option, e.g. {Anna|anne}. Never force a term "
-        "the handwriting does not support.\n"
+        + ". Where the handwriting fits one of these at least as well as the readers' "
+        "word, include it as an option, e.g. {Anna|anne}. Where only the list suggests "
+        "it, keep the word the image shows and add the term as a visible suggestion: "
+        "anne→Anna (?). Never replace a word with a term silently.\n"
     )
 
 

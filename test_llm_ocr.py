@@ -301,3 +301,9 @@ def test_adjudication_context_and_judge_model(monkeypatch):
     with patch.dict(llm_ocr._CALLERS, {"gemini": fake}):
         assert llm_ocr.adjudicate_png(PNG, readings, context=ctx, model="gemini-4-argon") == "Anna"
     assert used == [("gemini-4-argon", True)]
+
+
+def test_context_never_overrides_the_image():
+    prompt = llm_ocr.build_adjudication_prompt({"gemini": "a"}, {"previous": "b"})
+    assert "never override" in prompt and "word→suggestion (?)" in prompt
+    assert "[?: word word word]" in prompt
