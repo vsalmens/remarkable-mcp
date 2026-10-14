@@ -411,6 +411,14 @@ def write_outputs(job: Job) -> None:
 
 
 _WORD_RE = re.compile(r"\w")
+# A reader's description of a drawing, e.g. "[two horizontal lines; oval]".
+# Uncertainty markers ("[?]", "[?: w1 w2]") are not descriptions.
+_DESCRIPTION_RE = re.compile(r"\[(?!\?)[^\]]*\]")
+
+
+def _has_handwriting(text: str) -> bool:
+    """True if a reading holds written words, not only symbols or descriptions."""
+    return bool(_WORD_RE.search(_DESCRIPTION_RE.sub("", text)))
 
 
 async def _page_image(job: Job, zip_path: Path, page: int, render):
@@ -454,9 +462,10 @@ async def _read_page(job: Job, zip_path: Path, page: int, render, sem) -> None:
                 r.error = labels()["all_failed"]
                 return
             if all(t == "" for t in answered.values()) or (
-                marked is not None and not any(_WORD_RE.search(t) for t in answered.values())
+                marked is not None and not any(_has_handwriting(t) for t in answered.values())
             ):
-                # nothing written, or (on a PDF page) only lines and symbols
+                # nothing written, or (on a PDF page) only lines, symbols and
+                # descriptions of drawings
                 r.status = "done" if r.marked else "blank"
                 r.final = "" if r.marked else None
                 return

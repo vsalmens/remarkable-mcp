@@ -708,7 +708,15 @@ def test_pdf_job_reads_only_handwriting(tmp_path):
     assert data["pages"]["1"]["marked"] == ["efficacy predicts"]
 
 
-def test_pdf_symbols_only_are_not_handwriting(tmp_path):
+def test_drawing_descriptions_are_not_handwriting():
+    assert not transcribe._has_handwriting("[two horizontal lines; oval on the right]\n?\n?")
+    assert not transcribe._has_handwriting("! ~ —")
+    assert transcribe._has_handwriting("[arrow] see p. 4")
+    assert transcribe._has_handwriting("[?: word word]")
+
+
+@pytest.mark.parametrize("reading", ["! ~ —", "[horizontal pen strokes, no legible writing]"])
+def test_pdf_symbols_only_are_not_handwriting(tmp_path, reading):
     from remarkable_mcp.extract import analyze_pdf_page_annotations
 
     path = _annotated_pdf_zip(tmp_path)
@@ -729,7 +737,7 @@ def test_pdf_symbols_only_are_not_handwriting(tmp_path):
         return job
 
     with (
-        patch("remarkable_mcp.llm_ocr.ocr_png", side_effect=lambda png, b, *a: "! ~ —"),
+        patch("remarkable_mcp.llm_ocr.ocr_png", side_effect=lambda png, b, *a: reading),
         patch("remarkable_mcp.llm_ocr.adjudicate_png") as adj,
     ):
         job = asyncio.run(go())
