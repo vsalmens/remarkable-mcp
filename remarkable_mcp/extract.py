@@ -5,6 +5,7 @@ Text extraction helpers for reMarkable documents.
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -2508,10 +2509,16 @@ def _ocr_tesseract(rm_files: List[Path]) -> Optional[List[str]]:
 # ---------------------------------------------------------------------------
 
 # A word counts as marked when ink crosses at least this share of its width
-# within its line box extended downwards (underline) by MARK_BAND_BELOW times
-# the word height.
+# inside the band where a strike-through or an underline of that word lies:
+# from MARK_BAND_TOP below the top of the word box to MARK_BAND_BELOW below
+# its bottom (fractions of the word height). The band stays clear of the
+# lines above and below, so a mark on one line does not mark its neighbours.
 MARK_COVERAGE = 0.6
-MARK_BAND_BELOW = 0.6
+MARK_BAND_TOP = 0.2
+MARK_BAND_BELOW = 0.25
+# Ink near a word, out to ERASE_BAND_BELOW of its height below it, belongs to
+# the mark when erasing marks from the handwriting image.
+ERASE_BAND_BELOW = 0.6
 # Ink over a smaller share of a word (a mark running past the last word) is
 # still treated as part of the mark rather than as handwriting.
 TOUCH_COVERAGE = 0.15
@@ -2553,11 +2560,16 @@ def find_marked_words(mask, words: list, scale: float) -> Tuple[list, list]:
     for index, word in enumerate(words):
         x0, y0, x1, y1, text = word[:5]
         height = (y1 - y0) * scale
-        box = (x0 * scale, y0 * scale, x1 * scale, y1 * scale + MARK_BAND_BELOW * height)
-        coverage = _column_coverage(mask, box)
-        if coverage >= TOUCH_COVERAGE:
-            boxes.append(box)
-        if coverage >= MARK_COVERAGE:
+        erase_box = (x0 * scale, y0 * scale, x1 * scale, y1 * scale + ERASE_BAND_BELOW * height)
+        if _column_coverage(mask, erase_box) >= TOUCH_COVERAGE:
+            boxes.append(erase_box)
+        band = (
+            x0 * scale,
+            y0 * scale + MARK_BAND_TOP * height,
+            x1 * scale,
+            y1 * scale + MARK_BAND_BELOW * height,
+        )
+        if _column_coverage(mask, band) >= MARK_COVERAGE:
             if current and last_index is not None and index != last_index + 1:
                 phrases.append(" ".join(current))
                 current = []
@@ -2565,7 +2577,15 @@ def find_marked_words(mask, words: list, scale: float) -> Tuple[list, list]:
             last_index = index
     if current:
         phrases.append(" ".join(current))
-    return phrases, boxes
+    return [_tidy_phrase(p) for p in phrases], boxes
+
+
+def _tidy_phrase(phrase: str) -> str:
+    """Undo ligatures and words hyphenated across a line break."""
+    import unicodedata
+
+    phrase = unicodedata.normalize("NFKC", phrase)
+    return re.sub(r"(\w)- (\w)", r"\1\2", phrase)
 
 
 def analyze_pdf_page_annotations(
@@ -2627,7 +2647,9 @@ def _analyze_extracted(tmpdir_path: Path, page: int, scale: float) -> Optional[D
                 return None
             pdf_page = doc[pdf_page_index]
             pdf_w, pdf_h = pdf_page.rect.width, pdf_page.rect.height
-            words = pdf_page.get_text("words", sort=True)
+            # Native order follows the text blocks, so the columns of a
+            # two-column page stay apart (sort=True would interleave them).
+            words = sorted(pdf_page.get_text("words"), key=lambda w: w[5:8])
     except Exception:
         return None
 

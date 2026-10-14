@@ -662,6 +662,41 @@ def test_find_marked_words_groups_phrases():
     assert len(boxes) == 2  # "third" is barely touched (under the 15 % limit)
 
 
+def test_strike_through_marks_only_its_own_line():
+    from PIL import Image, ImageDraw
+
+    from remarkable_mcp.extract import find_marked_words
+
+    mask = Image.new("L", (200, 60), 0)
+    draw = ImageDraw.Draw(mask)
+    draw.line((5, 15, 120, 15), fill=255, width=2)  # through the middle of line 2
+    draw.line((5, 33, 120, 33), fill=255, width=2)  # just under line 3
+    words = [
+        (5, 0, 60, 10, "above"),
+        (65, 0, 120, 10, "it"),
+        (5, 11, 60, 21, "struck"),
+        (65, 11, 120, 21, "words"),
+        (5, 22, 60, 32, "underlined"),
+        (65, 22, 120, 32, "too"),
+        (5, 44, 60, 54, "below"),
+    ]
+    phrases, _ = find_marked_words(mask, words, 1.0)
+    assert phrases == ["struck words underlined too"]
+
+
+def test_marked_phrases_rejoin_hyphenated_words_and_ligatures():
+    from PIL import Image, ImageDraw
+
+    from remarkable_mcp.extract import find_marked_words
+
+    mask = Image.new("L", (200, 100), 0)
+    draw = ImageDraw.Draw(mask)
+    draw.line((5, 32, 60, 32), fill=255, width=2)
+    draw.line((5, 82, 60, 82), fill=255, width=2)
+    words = [(5, 10, 60, 30, "promi-"), (5, 60, 60, 80, "nent ﬁndings")]
+    assert find_marked_words(mask, words, 1.0)[0] == ["prominent findings"]
+
+
 def test_pdf_marks_come_from_the_text_layer(tmp_path):
     from remarkable_mcp.extract import analyze_pdf_page_annotations, document_has_pdf
 
