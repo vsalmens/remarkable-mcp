@@ -33,7 +33,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from remarkable_mcp import llm_ocr
 
@@ -58,6 +58,8 @@ class PageResult:
     final: Optional[str] = None
     agreement: Optional[float] = None
     error: Optional[str] = None
+    # Printed words the pen marked on a PDF page (from the text layer, no OCR)
+    marked: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -82,6 +84,9 @@ class Job:
     modified: Optional[str] = None  # document modification time (ISO 8601)
     page_ids: List[Optional[str]] = field(default_factory=list)  # stable ids, page order
     usage: Dict[str, dict] = field(default_factory=dict)  # model -> calls/tokens
+    # PDF pages: callable(source, page) -> {"marked", "residual_png"} or None
+    annotate: Optional[Callable] = None
+    extracted: Optional[Path] = None  # the document unpacked once, for annotate
 
     def page_id(self, page: int) -> Optional[str]:
         return self.page_ids[page - 1] if 0 < page <= len(self.page_ids) else None
@@ -214,6 +219,7 @@ TRANSCRIPT_LABELS: Dict[str, Dict[str, str]] = {
         "alternatives": "{n} alternative readings",
         "doubtful": "{n} doubtful",
         "suggestions": "{n} suggestions",
+        "marked": "Marked in the text",
         "illegible": "{n} illegible",
     },
     "fi": {
@@ -241,6 +247,7 @@ TRANSCRIPT_LABELS: Dict[str, Dict[str, str]] = {
         "alternatives": "{n} vaihtoehtolukua",
         "doubtful": "{n} epävarmaa",
         "suggestions": "{n} ehdotusta",
+        "marked": "Merkityt kohdat",
         "illegible": "{n} lukukelvotonta",
     },
 }
@@ -336,10 +343,14 @@ def write_outputs(job: Job) -> None:
         if r.status == "failed":
             lines += [f"_{lab['failed']}: {r.error}_", ""]
             continue
+        if r.marked:
+            lines += [f"_{lab['marked']}:_", ""] + [f"- {m}" for m in r.marked] + [""]
+        if not r.final:
+            continue
         if job.mode == "dual":
             lines += [_uncertainty_line(r), ""]
-        lines += [r.final or "", ""]
-        if job.mode == "dual":
+        lines += [r.final, ""]
+        if job.mode == "dual" and r.readings:
             summary = lab["readers_summary"].format(pct=_pct(r.agreement))
             lines += [f"<details><summary>{summary}</summary>", ""]
             for b in MODES["dual"]:
@@ -371,6 +382,7 @@ def write_outputs(job: Job) -> None:
                     str(p): {
                         "page_id": job.page_id(p),
                         "status": r.status,
+                        "marked": r.marked,
                         "final": r.final,
                         "readings": r.readings,
                         "agreement": r.agreement,
@@ -398,6 +410,25 @@ def write_outputs(job: Job) -> None:
 # ---------------------------------------------------------------------------
 
 
+_WORD_RE = re.compile(r"\w")
+
+
+async def _page_image(job: Job, zip_path: Path, page: int, render):
+    """The image to read for a page, and the printed words its pen marks cover.
+
+    On a PDF page the marks are taken from the text layer and only the rest of
+    the ink (margin notes, other handwriting) is returned as an image. Notebook
+    pages return the whole ink layer and ``None`` for the marks.
+    """
+    from remarkable_mcp.concurrency import run_blocking
+
+    if job.annotate is not None:
+        analysis = await run_blocking(job.annotate, job.extracted or zip_path, page)
+        if analysis is not None:
+            return analysis.get("residual_png"), list(analysis.get("marked") or [])
+    return await run_blocking(render, zip_path, page), None
+
+
 async def _read_page(job: Job, zip_path: Path, page: int, render, sem) -> None:
     """Phase 1: render, skip blank pages, collect every reader's text."""
     from remarkable_mcp.concurrency import run_blocking
@@ -406,9 +437,11 @@ async def _read_page(job: Job, zip_path: Path, page: int, render, sem) -> None:
     llm_ocr.USAGE_SINK.set(job.usage)  # this task's context; copied into worker threads
     async with sem:
         try:
-            png = await run_blocking(render, zip_path, page)
+            png, marked = await _page_image(job, zip_path, page, render)
+            r.marked = marked or []
             if png is None or not await run_blocking(has_ink, png):
-                r.status = "blank"
+                r.status = "done" if r.marked else "blank"
+                r.final = "" if r.marked else None
                 return
             backends = MODES[job.mode]
             texts = await asyncio.gather(
@@ -420,8 +453,12 @@ async def _read_page(job: Job, zip_path: Path, page: int, render, sem) -> None:
                 r.status = "failed"
                 r.error = labels()["all_failed"]
                 return
-            if all(t == "" for t in answered.values()):
-                r.status = "blank"
+            if all(t == "" for t in answered.values()) or (
+                marked is not None and not any(_WORD_RE.search(t) for t in answered.values())
+            ):
+                # nothing written, or (on a PDF page) only lines and symbols
+                r.status = "done" if r.marked else "blank"
+                r.final = "" if r.marked else None
                 return
             if job.mode == "dual":
                 a, g = r.readings.get("anthropic"), r.readings.get("gemini")
@@ -463,7 +500,7 @@ async def _adjudicate_page(job: Job, zip_path: Path, page: int, render, sem) -> 
     llm_ocr.USAGE_SINK.set(job.usage)
     async with sem:
         try:
-            png = await run_blocking(render, zip_path, page)
+            png, _ = await _page_image(job, zip_path, page, render)
             final = await run_blocking(
                 llm_ocr.adjudicate_png,
                 png,
@@ -482,10 +519,18 @@ async def _adjudicate_page(job: Job, zip_path: Path, page: int, render, sem) -> 
 
 async def run_job(job: Job, raw_doc: bytes, render, workers: int) -> None:
     tmp = None
+    unpacked = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as f:
             f.write(raw_doc)
             tmp = Path(f.name)
+        if job.annotate is not None:
+            import zipfile
+
+            unpacked = tempfile.TemporaryDirectory(prefix="remarkable-doc-")
+            with zipfile.ZipFile(tmp) as zf:
+                zf.extractall(unpacked.name)
+            job.extracted = Path(unpacked.name)
         sem = asyncio.Semaphore(max(1, workers))
         await asyncio.gather(*(_read_page(job, tmp, p, render, sem) for p in job.pages))
         pending = [p for p in job.pages if job.results[p].status == "pending"]
@@ -497,6 +542,13 @@ async def run_job(job: Job, raw_doc: bytes, render, workers: int) -> None:
             record_in_index(job)
         except Exception as e:  # the transcript is written; the index can catch up later
             logger.warning("Could not update the library index: %s", e)
+    except asyncio.CancelledError:
+        job.state = "cancelled"
+        if any(r.status == "done" for r in job.results.values()):
+            try:
+                write_outputs(job)  # keep what was finished
+            except Exception:
+                pass
     except Exception as e:
         logger.warning("Transcription job %s failed: %s", job.id, e)
         job.state = "failed"
@@ -507,6 +559,9 @@ async def run_job(job: Job, raw_doc: bytes, render, workers: int) -> None:
             pass
     finally:
         job.finished = time.time()
+        job.extracted = None
+        if unpacked is not None:
+            unpacked.cleanup()
         if tmp:
             tmp.unlink(missing_ok=True)
 
@@ -525,6 +580,7 @@ def start_job(
     document_id: Optional[str] = None,
     modified: Optional[str] = None,
     page_ids: Optional[List[Optional[str]]] = None,
+    annotate: Optional[Callable] = None,
 ) -> Job:
     job = Job(
         id=uuid.uuid4().hex[:8],
@@ -537,6 +593,7 @@ def start_job(
         document_id=document_id,
         modified=modified,
         page_ids=list(page_ids or []),
+        annotate=annotate,
     )
     job.results = {p: PageResult(page=p) for p in pages}
     _JOBS[job.id] = job
@@ -555,6 +612,14 @@ def _prune_jobs() -> None:
         : max(0, len(finished) - MAX_FINISHED_JOBS)
     ]:
         _JOBS.pop(job.id, None)
+
+
+def cancel_job(job_id: str) -> Optional[Job]:
+    """Stop a running job; finished pages are written, the rest stays pending."""
+    job = _JOBS.get(job_id)
+    if job and job.task and not job.task.done():
+        job.task.cancel()
+    return job
 
 
 def get_job(job_id: str) -> Optional[Job]:
@@ -602,6 +667,9 @@ def summarize(job: Job) -> dict:
         and all(r.status == "blank" for r in job.results.values())
     ):
         out["no_handwriting"] = True
+    marked = sorted(r.page for r in job.results.values() if r.marked)
+    if marked:
+        out["pages_with_marks"] = marked
     if job.usage:
         out["usage"] = job.usage
         cost = llm_ocr.estimate_cost(job.usage)
@@ -772,11 +840,27 @@ def start_sync(planned: List[dict], deleted: List[dict], unchanged: int, launch,
 
     async def go():
         sem = asyncio.Semaphore(max(1, parallel))
-        await asyncio.gather(*(one(doc, sem) for doc in planned))
-        run.state = "done"
-        run.finished = time.time()
+        try:
+            await asyncio.gather(*(one(doc, sem) for doc in planned))
+            run.state = "done"
+        except asyncio.CancelledError:
+            run.state = "cancelled"
+        finally:
+            run.finished = time.time()
 
     run.task = asyncio.get_running_loop().create_task(go())
+    return run
+
+
+def cancel_sync(sync_id: str) -> Optional[SyncRun]:
+    """Stop a sync: no new documents start and running ones are cancelled."""
+    run = _SYNCS.get(sync_id)
+    if run is None:
+        return None
+    if run.task and not run.task.done():
+        run.task.cancel()
+    for job_id in run.job_ids:
+        cancel_job(job_id)
     return run
 
 

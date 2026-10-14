@@ -614,3 +614,160 @@ async def test_sync_tool_transcribes_only_changes(mock_get_rmapi, monkeypatch):
     assert entry["status"] == "deleted" and entry["output_markdown"]
     assert "s" not in transcribe.load_index()["documents"]
     assert "ib" not in transcribe.load_index()["documents"]  # inside a deleted folder
+
+
+def _annotated_pdf_zip(tmp_path, scribble=True):
+    import io
+    import zipfile
+
+    from remarkable_mcp import notebooks, strokes
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=445, height=594)
+    page.insert_text((50, 100), "Self efficacy predicts adherence strongly", fontsize=14)
+    page.insert_text((50, 200), "An unmarked line of ordinary text", fontsize=14)
+    pdf = doc.tobytes()
+    rm = notebooks.page_rm_bytes("")
+    # underline below "efficacy predicts"
+    rm = strokes.append_strokes(rm, [{"points": [[82 / 445, 104 / 594], [205 / 445, 104 / 594]]}])
+    if scribble:
+        zigzag = [[0.1, 0.6], [0.2, 0.65], [0.3, 0.6], [0.4, 0.68], [0.5, 0.6]]
+        rm = strokes.append_strokes(rm, [{"points": zigzag}])
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        content = {"cPages": {"pages": [{"id": "page-1", "redir": {"value": 0}}]}}
+        z.writestr("doc.content", json.dumps(content))
+        z.writestr("page-1.rm", rm)
+        z.writestr("doc.pdf", pdf)
+    path = tmp_path / "doc.zip"
+    path.write_bytes(buf.getvalue())
+    return path
+
+
+def test_find_marked_words_groups_phrases():
+    from PIL import Image, ImageDraw
+
+    from remarkable_mcp.extract import find_marked_words
+
+    mask = Image.new("L", (400, 100), 0)
+    ImageDraw.Draw(mask).line((10, 32, 150, 32), fill=255, width=2)  # under words 0-1
+    words = [
+        (5, 10, 60, 30, "first"),
+        (70, 10, 140, 30, "second"),
+        (150, 10, 220, 30, "third"),
+        (5, 60, 60, 80, "next"),
+    ]
+    phrases, boxes = find_marked_words(mask, words, 1.0)
+    assert phrases == ["first second"]
+    assert len(boxes) == 2  # "third" is barely touched (under the 15 % limit)
+
+
+def test_pdf_marks_come_from_the_text_layer(tmp_path):
+    from remarkable_mcp.extract import analyze_pdf_page_annotations, document_has_pdf
+
+    path = _annotated_pdf_zip(tmp_path)
+    assert document_has_pdf(path)
+    result = analyze_pdf_page_annotations(path, 1)
+    assert result["marked"] == ["efficacy predicts"] and result["text_layer"]
+    assert transcribe.has_ink(result["residual_png"])  # the zigzag, not the underline
+    clean = analyze_pdf_page_annotations(_annotated_pdf_zip(tmp_path, scribble=False), 1)
+    assert clean["marked"] == ["efficacy predicts"] and clean["residual_png"] is None
+
+
+def test_pdf_job_reads_only_handwriting(tmp_path):
+    from remarkable_mcp.extract import analyze_pdf_page_annotations
+
+    path = _annotated_pdf_zip(tmp_path, scribble=False)
+    calls = []
+
+    async def go():
+        job = transcribe.start_job(
+            document="Paper.pdf",
+            path="/R/Paper.pdf",
+            mode="dual",
+            pages=[1],
+            total_pages=1,
+            raw_doc=path.read_bytes(),
+            render=lambda z, p: INK,
+            workers=1,
+            annotate=analyze_pdf_page_annotations,
+        )
+        await job.task
+        return job
+
+    with patch("remarkable_mcp.llm_ocr.ocr_png", side_effect=lambda *a: calls.append(a) or "x"):
+        job = asyncio.run(go())
+    assert calls == []  # an underline alone needs no OCR
+    r = job.results[1]
+    assert r.status == "done" and r.marked == ["efficacy predicts"] and r.final == ""
+    s = transcribe.summarize(job)
+    assert s["pages_with_marks"] == [1]
+    md = open(s["output_markdown"], encoding="utf-8").read()
+    assert "Marked in the text" in md and "- efficacy predicts" in md
+    data = json.load(open(s["output_json"], encoding="utf-8"))
+    assert data["pages"]["1"]["marked"] == ["efficacy predicts"]
+
+
+def test_pdf_symbols_only_are_not_handwriting(tmp_path):
+    from remarkable_mcp.extract import analyze_pdf_page_annotations
+
+    path = _annotated_pdf_zip(tmp_path)
+
+    async def go():
+        job = transcribe.start_job(
+            document="Paper.pdf",
+            path="/R/Paper.pdf",
+            mode="dual",
+            pages=[1],
+            total_pages=1,
+            raw_doc=path.read_bytes(),
+            render=lambda z, p: INK,
+            workers=1,
+            annotate=analyze_pdf_page_annotations,
+        )
+        await job.task
+        return job
+
+    with (
+        patch("remarkable_mcp.llm_ocr.ocr_png", side_effect=lambda png, b, *a: "! ~ —"),
+        patch("remarkable_mcp.llm_ocr.adjudicate_png") as adj,
+    ):
+        job = asyncio.run(go())
+    assert job.results[1].final == "" and job.results[1].marked == ["efficacy predicts"]
+    adj.assert_not_called()
+
+
+def test_cancel_job_keeps_finished_pages():
+    import threading
+
+    gate = threading.Event()
+
+    def ocr(png, backend):
+        if not gate.is_set():
+            gate.set()
+            return "first page"
+        threading.Event().wait(5)  # the second page hangs until cancelled
+        return "late"
+
+    async def go():
+        job = transcribe.start_job(
+            document="D",
+            path="/D",
+            mode="gemini",
+            pages=[1, 2],
+            total_pages=2,
+            raw_doc=b"zip",
+            render=lambda z, p: INK,
+            workers=1,
+        )
+        while job.results[1].status != "done":
+            await asyncio.sleep(0.01)
+        transcribe.cancel_job(job.id)
+        await job.task
+        return job
+
+    with patch("remarkable_mcp.llm_ocr.ocr_png", side_effect=lambda png, b, *a: ocr(png, b)):
+        job = asyncio.run(go())
+    assert job.state == "cancelled"
+    assert job.results[1].final == "first page" and job.results[2].status != "done"
+    assert open(transcribe.summarize(job)["output_markdown"], encoding="utf-8").read()

@@ -696,13 +696,27 @@ add or override prices.
 `remarkable_transcribe_sync()` compares the tablet with the library index
 `_library.json` (in the transcript folder) and transcribes only new documents and
 documents modified since their last full transcription; unchanged pages come
-from the cache. PDFs and e-books are included: their pages are rendered without
-the printed content, and a document without handwriting is recorded in the index
-but leaves no transcript files. Documents deleted from the tablet are marked
+from the cache. PDFs and e-books are included (see below), and a document without
+handwriting or pen marks is recorded in the index but leaves no transcript
+files. Documents in the trash are skipped. Documents deleted from the tablet are marked
 `"deleted"` in the index and their transcripts are kept, so the transcripts can
 serve as an archive. Use `dry_run=True` to see the plan and `folder="/Journal"` to
 limit the scope. Progress: `remarkable_transcribe_status("sync-…")`. Run it by hand
 or from a scheduled task.
+
+`remarkable_transcribe_cancel(job_id)` stops a job or a sync (`"sync-…"`).
+Pages already finished are written out and stay cached.
+
+### Underlines and highlights on PDFs
+
+On a PDF page with a text layer, words you underlined, circled, struck or
+highlighted with the pen are read from the PDF's own text instead of by OCR,
+so they cost nothing and come out exact. They appear as **Marked in the text**
+for each page, one phrase per run of marked words. Only the ink that is left
+over after the marked words are taken away (margin notes, arrows, handwriting)
+goes to the OCR models; a page with marks only makes no API calls. Ink is
+matched to a word when it covers most of the word's width on the word or just
+below it. Scanned PDFs without a text layer fall back to OCR of all ink.
 
 ### Example configuration
 

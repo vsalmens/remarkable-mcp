@@ -2501,3 +2501,168 @@ def _ocr_tesseract(rm_files: List[Path]) -> Optional[List[str]]:
     except ImportError:
         # OCR dependencies not installed
         return None
+
+
+# ---------------------------------------------------------------------------
+# Pen marks on PDF pages: printed text under the ink, handwriting apart from it
+# ---------------------------------------------------------------------------
+
+# A word counts as marked when ink crosses at least this share of its width
+# within its line box extended downwards (underline) by MARK_BAND_BELOW times
+# the word height.
+MARK_COVERAGE = 0.6
+MARK_BAND_BELOW = 0.6
+# Ink over a smaller share of a word (a mark running past the last word) is
+# still treated as part of the mark rather than as handwriting.
+TOUCH_COVERAGE = 0.15
+_INK_ALPHA = 40
+_RESIDUAL_MIN_PIXELS = 120
+
+
+def _column_coverage(mask, box) -> float:
+    """Share of columns in ``box`` (of a 0/255 mask) that contain any ink."""
+    from PIL import Image
+
+    x0, y0, x1, y1 = (int(round(v)) for v in box)
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(mask.width, x1), min(mask.height, y1)
+    if x1 - x0 < 1 or y1 - y0 < 1:
+        return 0.0
+    band = mask.crop((x0, y0, x1, y1))
+    # Average each column down to one pixel: a non-zero average means the
+    # column holds ink (word bands are short enough that one inked pixel
+    # never rounds down to zero).
+    columns = band.resize((x1 - x0, 1), Image.Resampling.BOX)
+    inked = sum(1 for v in columns.tobytes() if v > 0)
+    return inked / (x1 - x0)
+
+
+def find_marked_words(mask, words: list, scale: float) -> Tuple[list, list]:
+    """Group printed words that carry pen marks into phrases.
+
+    ``mask`` is an 'L' image (255 = ink) aligned with the PDF page at ``scale``
+    pixels per point; ``words`` are PyMuPDF word tuples (x0, y0, x1, y1, text,
+    ...) in reading order. Returns ``(phrases, boxes)``: the marked phrases and
+    the pixel boxes of every word the pen touched, so that ink can be told
+    apart from handwriting.
+    """
+    phrases: list = []
+    boxes: list = []
+    current: list = []
+    last_index = None
+    for index, word in enumerate(words):
+        x0, y0, x1, y1, text = word[:5]
+        height = (y1 - y0) * scale
+        box = (x0 * scale, y0 * scale, x1 * scale, y1 * scale + MARK_BAND_BELOW * height)
+        coverage = _column_coverage(mask, box)
+        if coverage >= TOUCH_COVERAGE:
+            boxes.append(box)
+        if coverage >= MARK_COVERAGE:
+            if current and last_index is not None and index != last_index + 1:
+                phrases.append(" ".join(current))
+                current = []
+            current.append(text)
+            last_index = index
+    if current:
+        phrases.append(" ".join(current))
+    return phrases, boxes
+
+
+def analyze_pdf_page_annotations(
+    source: Path, page: int = 1, scale: float = 2.0
+) -> Optional[Dict[str, Any]]:
+    """Separate pen marks on a PDF page into marked printed text and handwriting.
+
+    Returns None for pages without a PDF underlay (notebook pages, pages added
+    to a PDF), so callers can treat them as handwriting. Otherwise returns
+    ``{"marked": [phrases], "residual_png": png | None, "text_layer": bool}``:
+    the printed words the pen underlined, circled, struck or highlighted (read
+    from the PDF's text layer, no OCR needed) and an image of the remaining ink
+    (margin notes and other handwriting), or None when nothing else is written.
+    Without a text layer (a scanned PDF) all ink is returned as residual.
+
+    ``source`` is the document zip or a directory it was extracted to; pass the
+    directory when analysing many pages of a large document.
+    """
+    source = Path(source)
+    if source.is_dir():
+        return _analyze_extracted(source, page, scale)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        try:
+            with zipfile.ZipFile(source, "r") as zf:
+                zf.extractall(tmpdir)
+        except Exception:
+            return None
+        return _analyze_extracted(Path(tmpdir), page, scale)
+
+
+def document_has_pdf(zip_path: Path) -> bool:
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            return any(name.lower().endswith(".pdf") for name in zf.namelist())
+    except Exception:
+        return False
+
+
+def _analyze_extracted(tmpdir_path: Path, page: int, scale: float) -> Optional[Dict[str, Any]]:
+    import io
+
+    import fitz
+    from PIL import Image, ImageDraw
+
+    pdf_files = list(tmpdir_path.glob("**/*.pdf"))
+    if not pdf_files:
+        return None
+    pdf_page_index = _resolve_pdf_page_index(tmpdir_path, page)
+    if pdf_page_index is None:
+        return None
+    content_stems = {p.stem for p in tmpdir_path.glob("*.content")}
+    matching = [p for p in pdf_files if p.stem in content_stems]
+    pdf_path = matching[0] if matching else sorted(pdf_files)[0]
+    rm_file = _select_rm_file_for_page(tmpdir_path, _get_ordered_rm_files(tmpdir_path), page)
+
+    try:
+        with fitz.open(pdf_path) as doc:
+            if pdf_page_index >= len(doc):
+                return None
+            pdf_page = doc[pdf_page_index]
+            pdf_w, pdf_h = pdf_page.rect.width, pdf_page.rect.height
+            words = pdf_page.get_text("words", sort=True)
+    except Exception:
+        return None
+
+    out_w, out_h = max(1, int(pdf_w * scale)), max(1, int(pdf_h * scale))
+    result: Dict[str, Any] = {"marked": [], "residual_png": None, "text_layer": bool(words)}
+    if rm_file is None:
+        return result
+
+    with tempfile.TemporaryDirectory() as svg_dir:
+        svg_path = Path(svg_dir) / "ink.svg"
+        if not _rm_to_svg(rm_file, svg_path):
+            return result
+        svg_text = svg_path.read_text()
+    blocks = _v6_blocks(rm_file)
+    paper_size = _v6_paper_size(blocks) if blocks is not None else None
+    viewbox = _annotation_page_viewbox(
+        pdf_w, pdf_h, _points_per_unit(paper_size), centered_x=blocks is not None
+    )
+    svg = _rewrite_svg_root(svg_text, viewbox=viewbox, width=out_w, height=out_h)
+    ink_png = _svg_string_to_png(svg, out_w, out_h, None)
+    if ink_png is None:
+        return result
+
+    ink = Image.open(io.BytesIO(ink_png)).convert("RGBA").getchannel("A")
+    mask = ink.point(lambda v: 255 if v > _INK_ALPHA else 0)
+    if words:
+        result["marked"], boxes = find_marked_words(mask, words, scale)
+        if boxes:
+            draw = ImageDraw.Draw(mask)
+            pad = 2 * scale
+            for x0, y0, x1, y1 in boxes:
+                draw.rectangle((x0 - pad, y0 - pad, x1 + pad, y1 + pad), fill=0)
+    if mask.histogram()[255] >= _RESIDUAL_MIN_PIXELS * scale:
+        residual = mask.point(lambda v: 0 if v else 255)  # black ink on white
+        buf = io.BytesIO()
+        residual.save(buf, format="PNG")
+        result["residual_png"] = buf.getvalue()
+    return result

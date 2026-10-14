@@ -47,6 +47,8 @@ from remarkable_mcp.exporters import (
     write_native_pdf_export,
 )
 from remarkable_mcp.extract import (
+    analyze_pdf_page_annotations,
+    document_has_pdf,
     extract_text_from_document_zip,
     extract_text_from_epub,
     extract_text_from_pdf,
@@ -2631,7 +2633,11 @@ def _page_count_and_ids(raw_doc: bytes):
         tmp.write(raw_doc)
         tmp_path = Path(tmp.name)
     try:
-        return get_document_page_count(tmp_path), get_page_ids_from_zip(tmp_path)
+        return (
+            get_document_page_count(tmp_path),
+            get_page_ids_from_zip(tmp_path),
+            document_has_pdf(tmp_path),
+        )
     finally:
         tmp_path.unlink(missing_ok=True)
 
@@ -2649,7 +2655,7 @@ async def _start_transcription(
             "This transport returned a flattened PDF without an ink layer.",
             "Use the cloud or SSH transport for transcription.",
         )
-    total, page_ids = await run_blocking(_page_count_and_ids, raw_doc)
+    total, page_ids, has_pdf = await run_blocking(_page_count_and_ids, raw_doc)
     try:
         page_list = transcribe.parse_pages(pages, total)
     except ValueError as e:
@@ -2671,6 +2677,8 @@ async def _start_transcription(
         document_id=getattr(target_doc, "ID", None),
         modified=_modified_iso(target_doc),
         page_ids=page_ids,
+        # PDF pages: marked printed text from the text layer, OCR only for handwriting
+        annotate=analyze_pdf_page_annotations if has_pdf else None,
     )
 
 
@@ -2922,6 +2930,37 @@ async def remarkable_transcribe_sync(
         )
 
 
+@mcp.tool(annotations=TRANSCRIBE_ANNOTATIONS)
+async def remarkable_transcribe_cancel(job_id: str) -> str:
+    """
+    <usecase>Stop a running transcription job or sync.</usecase>
+    <instructions>
+    Pass a job id or a sync id (sync-…). Pages already finished are kept and
+    written to the transcript; the rest are not sent to any API. A cancelled
+    sync starts no further documents. Nothing on the tablet is changed.
+    </instructions>
+    """
+    from remarkable_mcp import transcribe
+
+    if job_id.startswith("sync-"):
+        run = transcribe.cancel_sync(job_id)
+        if run is None:
+            return make_error(
+                error_type="job_not_found",
+                message=f"No sync '{job_id}' in this server process.",
+                suggestion="List jobs and syncs with remarkable_transcribe_status().",
+            )
+        return make_response({"sync_id": run.id, "cancelled": True}, f"Sync {run.id} stopped.")
+    job = transcribe.cancel_job(job_id)
+    if job is None:
+        return make_error(
+            error_type="job_not_found",
+            message=f"No job '{job_id}' in this server process.",
+            suggestion="List jobs with remarkable_transcribe_status().",
+        )
+    return make_response({"job_id": job.id, "cancelled": True}, f"Job {job.id} stopped.")
+
+
 @mcp.tool(annotations=STATUS_ANNOTATIONS)
 async def remarkable_transcribe_status(
     job_id: Optional[str] = None,
@@ -2986,6 +3025,8 @@ async def remarkable_transcribe_status(
                 if not any(transcribe.uncertainty(r.final).values()):
                     continue
             entry = {"page": p, "status": r.status, "final": r.final}
+            if r.marked:
+                entry["marked"] = r.marked
             if job.mode == "dual":
                 entry["agreement"] = r.agreement
                 entry["uncertainty"] = transcribe.uncertainty(r.final)
