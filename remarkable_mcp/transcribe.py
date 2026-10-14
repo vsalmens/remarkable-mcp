@@ -93,6 +93,7 @@ class Job:
     extracted: Optional[Path] = None  # the document unpacked once, for annotate
     batch: bool = False  # Claude requests go out as Message Batches (library syncs)
     batcher: Optional[Any] = None
+    batch_slots: Optional[Any] = None  # asyncio.Semaphore of pages in flight
 
     def page_id(self, page: int) -> Optional[str]:
         return self.page_ids[page - 1] if 0 < page <= len(self.page_ids) else None
@@ -639,11 +640,13 @@ async def _tracked(job: Job, coro):
     from remarkable_mcp import batching
 
     batching.BATCHER.set(batcher)  # this page task's context, copied into its calls
-    batcher.enter()
-    try:
-        return await coro
-    finally:
-        batcher.leave()
+    # A page waiting for a slot is not counted: it cannot add to the batch yet.
+    async with job.batch_slots:
+        batcher.enter()
+        try:
+            return await coro
+        finally:
+            batcher.leave()
 
 
 async def _page_image(job: Job, zip_path: Path, page: int, render):
@@ -838,8 +841,10 @@ async def run_job(job: Job, raw_doc: bytes, render, workers: int) -> None:
             from remarkable_mcp import batching
 
             job.batcher = batching.shared()
-            # every page at once: a page waiting for its batch holds no API slot
-            workers = len(job.pages)
+            # Pages in flight per document: each holds its page image while it
+            # waits for the batch, so a long book must not hold all of them.
+            job.batch_slots = asyncio.Semaphore(batching.pages_in_flight())
+            workers = len(job.pages)  # the slots limit them instead
         sem = asyncio.Semaphore(max(1, workers))
         await asyncio.gather(
             *(_tracked(job, _read_page(job, tmp, p, render, sem)) for p in job.pages)

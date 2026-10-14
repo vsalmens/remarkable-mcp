@@ -50,6 +50,14 @@ def enabled() -> bool:
     return os.environ.get("REMARKABLE_BATCH", "1").strip().lower() not in ("0", "false", "no", "")
 
 
+def pages_in_flight() -> int:
+    """Pages of one document worked on at once in a batched job (default 48)."""
+    try:
+        return max(1, int(os.environ.get("REMARKABLE_BATCH_PAGES", "48")))
+    except ValueError:
+        return 48
+
+
 def _max_wait() -> float:
     try:
         return max(5.0, float(os.environ.get("REMARKABLE_BATCH_MAX_WAIT", "120")))

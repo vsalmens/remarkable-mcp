@@ -178,3 +178,41 @@ def test_sync_jobs_batch_their_claude_calls(tmp_path, monkeypatch):
     with patch("remarkable_mcp.llm_ocr.ocr_png", side_effect=ocr):
         job = asyncio.run(go())
     assert job.state == "done" and seen == [True, True, True]
+
+
+def test_batched_job_holds_a_limited_number_of_pages(tmp_path, monkeypatch):
+    import asyncio
+    from unittest.mock import patch
+
+    from remarkable_mcp import transcribe
+    from test_transcribe import INK
+
+    monkeypatch.setenv("REMARKABLE_TRANSCRIPT_DIR", str(tmp_path / "out"))
+    monkeypatch.setenv("REMARKABLE_OCR_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("REMARKABLE_BATCH_PAGES", "3")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "a")
+    now, peak = [0], [0]
+    lock = threading.Lock()
+
+    def ocr(png, backend, *a):
+        import time
+
+        with lock:
+            now[0] += 1
+            peak[0] = max(peak[0], now[0])
+        time.sleep(0.02)
+        with lock:
+            now[0] -= 1
+        return "text"
+
+    async def go():
+        job = transcribe.start_job(
+            document="N", path="/N", mode="anthropic", pages=list(range(1, 11)),
+            total_pages=10, raw_doc=b"zip", render=lambda z, p: INK, workers=1, batch=True,
+        )
+        await job.task
+        return job
+
+    with patch("remarkable_mcp.llm_ocr.ocr_png", side_effect=ocr):
+        job = asyncio.run(go())
+    assert job.state == "done" and 1 < peak[0] <= 3

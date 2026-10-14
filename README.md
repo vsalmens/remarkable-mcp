@@ -729,7 +729,7 @@ Requests from all documents of a sync that are being worked on go out together
 once every page is waiting for its answer (or after
 `REMARKABLE_BATCH_MAX_WAIT` seconds, default 120); anything a batch fails to
 answer is asked directly, so no page is lost. A sync then works on 8 documents
-at a time. `remarkable_transcribe` and `remarkable_read` never wait for a
+at a time, up to 48 pages of each at once (`REMARKABLE_BATCH_PAGES`). `remarkable_transcribe` and `remarkable_read` never wait for a
 batch. `batch=False` or `REMARKABLE_BATCH=0` turns it off; job usage lists
 batched tokens as `"<model> (batch)"` and prices them at half. Gemini calls are
 made directly.
