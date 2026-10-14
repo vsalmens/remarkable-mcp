@@ -569,7 +569,17 @@ async def test_sync_tool_transcribes_only_changes(mock_get_rmapi, monkeypatch):
         is_cloud_archived=False,
         ModifiedClient="2026-10-13T10:00:00",
     )
-    client = Mock(get_meta_items=Mock(return_value=[folder, secret, doc]))
+    binned = Mock(ID="b", VissibleName="Old", Parent="trash", is_folder=True)
+    binned.is_cloud_archived = None  # cloud items carry no flag; the parent says "trash"
+    in_bin = Mock(
+        ID="ib",
+        VissibleName="Draft",
+        Parent="b",
+        is_folder=False,
+        is_cloud_archived=None,
+        ModifiedClient="2026-10-01T00:00:00",
+    )
+    client = Mock(get_meta_items=Mock(return_value=[folder, secret, doc, binned, in_bin]))
     client.download.return_value = _make_notebook_zip(notebooks.page_rm_bytes("Hello ink"))
     mock_get_rmapi.return_value = client
 
@@ -597,9 +607,10 @@ async def test_sync_tool_transcribes_only_changes(mock_get_rmapi, monkeypatch):
         doc.ModifiedClient = "2026-10-14T09:00:00"
         assert (await call({"dry_run": True}))["changed"] == ["/Notes"]
 
-        client.get_meta_items.return_value = [folder, secret]
+        client.get_meta_items.return_value = [folder, secret, binned, in_bin]
         gone = await call({})
         assert gone["deleted_from_tablet"] == ["/Notes"]
     entry = transcribe.load_index()["documents"]["doc-1"]
     assert entry["status"] == "deleted" and entry["output_markdown"]
     assert "s" not in transcribe.load_index()["documents"]
+    assert "ib" not in transcribe.load_index()["documents"]  # inside a deleted folder

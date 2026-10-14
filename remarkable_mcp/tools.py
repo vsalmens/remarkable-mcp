@@ -217,6 +217,22 @@ def _is_cloud_archived(item) -> bool:
     return parent == "trash"
 
 
+def _is_in_trash(item, items_by_id: dict) -> bool:
+    """True if the item or any folder above it is in the trash.
+
+    A document inside a deleted folder keeps that folder as its parent, so
+    checking the item alone misses it.
+    """
+    seen = set()
+    while item is not None and getattr(item, "ID", None) not in seen:
+        if _is_cloud_archived(item):
+            return True
+        seen.add(getattr(item, "ID", None))
+        parent = item.Parent if hasattr(item, "Parent") else getattr(item, "parent", "")
+        item = items_by_id.get(parent) if parent else None
+    return False
+
+
 def _modified_sort_key(item) -> float:
     """Return a sortable timestamp for an item's modified date.
 
@@ -2840,7 +2856,7 @@ async def remarkable_transcribe_sync(
 
         documents, by_id = [], {}
         for item in collection:
-            if item.is_folder or _is_cloud_archived(item):
+            if item.is_folder or _is_in_trash(item, items_by_id):
                 continue
             full_path = get_item_path(item, items_by_id)
             if not _is_within_root(full_path, root):
