@@ -20,6 +20,7 @@ from typing import Optional, Set
 
 from mcp.types import Completion, ResourceTemplateReference
 
+from remarkable_mcp.policy import is_excluded
 from remarkable_mcp.server import mcp
 
 logger = logging.getLogger(__name__)
@@ -43,7 +44,12 @@ def _get_root_path() -> str:
 
 
 def _is_within_root(path: str, root: str) -> bool:
-    """Check if a path is within the configured root (case-insensitive)."""
+    """Check if a path is within the configured root (case-insensitive).
+
+    Paths listed in REMARKABLE_EXCLUDE_PATHS are never within root.
+    """
+    if is_excluded(path):
+        return False
     if root == "/":
         return True
     # Path must equal root or be a child of root (case-insensitive)

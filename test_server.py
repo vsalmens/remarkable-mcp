@@ -138,7 +138,7 @@ class TestMCPServerInitialization:
         the default cloud surface is 14 tools.
         """
         tools = await _list_tools()
-        assert len(tools) == 14, f"Expected 14 tools, got {len(tools)}"
+        assert len(tools) == 16, f"Expected 16 tools, got {len(tools)}"
 
     @pytest.mark.asyncio
     async def test_tool_schemas(self):
@@ -1585,7 +1585,7 @@ class TestE2E:
         """Test that server can list all tools (e2e)."""
         tools = await _list_tools()
 
-        assert len(tools) == 14
+        assert len(tools) == 16
 
         # Check each tool has required properties and starts with remarkable_
         for tool in tools:

@@ -1,0 +1,5 @@
+# Names and terms you write often. Copy to ~/.remarkable/ocr-vocabulary.txt.
+# One per line or comma-separated; lines starting with # are ignored.
+# The file is read on every call, so edits apply without a restart.
+Anna, Bruno, Carla
+ROTEM, tranexamic acid

@@ -253,7 +253,21 @@ and sync to all your devices:
 
     # Add OCR instructions based on configuration
     uses_google_vision = ocr_backend == "google" or (ocr_backend == "auto" and has_google_vision)
-    if uses_google_vision:
+    if ocr_backend in ("gemini", "anthropic"):
+        instructions += f"""
+## OCR ({ocr_backend} LLM transcription)
+
+Handwriting is transcribed by a multimodal LLM ({ocr_backend}) and cached on disk,
+so each page is sent once. Prefer one page at a time with
+`remarkable_image(document, page, include_ocr=True)`; `ocr_backend=` on that call
+overrides the backend for comparisons.
+
+For whole notebooks use `remarkable_transcribe(document)`: it runs in the
+background on the server (dual reading by default) and
+`remarkable_transcribe_status(job_id, include_text=True)` returns the text.
+Do not page through a long notebook image by image.
+"""
+    elif uses_google_vision:
         instructions += """
 ## OCR (Google Vision Selected)
 

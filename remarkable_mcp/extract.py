@@ -14,6 +14,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from xml.sax.saxutils import escape as _xml_escape
 
+from remarkable_mcp import llm_ocr
+from remarkable_mcp.llm_ocr import LLM_OCR_BACKENDS
+from remarkable_mcp.policy import get_ocr_language_hints, vision_request
+
 logger = logging.getLogger(__name__)
 
 
@@ -118,7 +122,7 @@ def get_background_color() -> str:
     return os.environ.get("REMARKABLE_BACKGROUND_COLOR", _DEFAULT_BACKGROUND_COLOR)
 
 
-OCR_BACKENDS = frozenset({"auto", "google", "tesseract"})
+OCR_BACKENDS = frozenset({"auto", "google", "tesseract", "gemini", "anthropic"})
 
 
 def get_ocr_backend() -> str:
@@ -2184,6 +2188,7 @@ def extract_handwriting_ocr(rm_files: List[Path]) -> tuple[Optional[List[str]], 
     Supports multiple backends (set REMARKABLE_OCR_BACKEND env var):
     - "google": Google Cloud Vision - best for handwriting
     - "tesseract": pytesseract - basic OCR, rasterized locally with PyMuPDF
+    - "gemini" / "anthropic": multimodal LLM transcription, cached on disk
     - "auto" (default): Google if API key provided, else Tesseract
 
     Returns:
@@ -2199,6 +2204,13 @@ def extract_handwriting_ocr(rm_files: List[Path]) -> tuple[Optional[List[str]], 
         else:
             backend = "tesseract"
 
+    if backend in LLM_OCR_BACKENDS:
+        result = _ocr_llm(rm_files, backend)
+        if result is not None:
+            return (result or None, backend)
+        logger.warning("%s OCR returned nothing; falling back", backend)
+        backend = "google" if os.environ.get("GOOGLE_VISION_API_KEY") else "tesseract"
+
     if backend == "google":
         result = _ocr_google_vision(rm_files)
         if result:
@@ -2207,6 +2219,48 @@ def extract_handwriting_ocr(rm_files: List[Path]) -> tuple[Optional[List[str]], 
         return (result, "tesseract")
     result = _ocr_tesseract(rm_files)
     return (result, "tesseract")
+
+
+def _rm_to_png_bytes(rm_file: Path) -> Optional[bytes]:
+    """Render one .rm page to a white-background PNG for OCR."""
+    import tempfile
+
+    tmp_svg_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".svg", delete=False) as tmp_svg:
+            tmp_svg_path = Path(tmp_svg.name)
+        if not _rm_to_svg(rm_file, tmp_svg_path):
+            return None
+        return _svg_string_to_png(
+            tmp_svg_path.read_text(),
+            REMARKABLE_WIDTH,
+            REMARKABLE_HEIGHT,
+            "#FFFFFF",
+        )
+    except Exception:
+        return None
+    finally:
+        if tmp_svg_path:
+            tmp_svg_path.unlink(missing_ok=True)
+
+
+def _ocr_llm(rm_files: List[Path], backend: str) -> Optional[List[str]]:
+    """OCR each page with a multimodal LLM (results cached on disk)."""
+    results = []
+    answered = 0
+    for rm_file in rm_files:
+        png = _rm_to_png_bytes(rm_file)
+        if png is None:
+            continue
+        text = llm_ocr.ocr_png(png, backend)
+        if text is None:
+            continue
+        answered += 1
+        if text:
+            results.append(text)
+    if answered == 0:
+        return None  # backend unavailable: let the caller fall back
+    return results
 
 
 def _ocr_google_vision(rm_files: List[Path]) -> Optional[List[str]]:
@@ -2265,14 +2319,7 @@ def _ocr_google_vision_rest(rm_files: List[Path], api_key: str) -> Optional[List
 
             # Call Google Vision REST API
             url = f"https://vision.googleapis.com/v1/images:annotate?key={api_key}"
-            payload = {
-                "requests": [
-                    {
-                        "image": {"content": image_content},
-                        "features": [{"type": "DOCUMENT_TEXT_DETECTION"}],
-                    }
-                ]
-            }
+            payload = {"requests": [vision_request(image_content)]}
 
             response = requests.post(url, json=payload, timeout=60)
             if response.status_code == 200:
@@ -2332,7 +2379,13 @@ def _ocr_google_vision_sdk(rm_files: List[Path]) -> Optional[List[str]]:
                 image = vision.Image(content=png)
 
                 # Use DOCUMENT_TEXT_DETECTION for best handwriting results
-                response = client.document_text_detection(image=image)
+                hints = get_ocr_language_hints()
+                if hints:
+                    response = client.document_text_detection(
+                        image=image, image_context={"language_hints": hints}
+                    )
+                else:
+                    response = client.document_text_detection(image=image)
 
                 if response.error.message:
                     continue

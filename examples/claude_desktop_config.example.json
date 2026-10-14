@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "remarkable": {
+      "command": "/Users/YOU/.local/bin/remarkable-mcp",
+      "args": ["--read-only"],
+      "env": {
+        "REMARKABLE_EXCLUDE_PATHS": "/Private,/Work/Clients",
+        "REMARKABLE_OCR_LANGUAGES": "en,de",
+        "REMARKABLE_OCR_BACKEND": "anthropic",
+        "ANTHROPIC_API_KEY": "sk-ant-...",
+        "GEMINI_API_KEY": "...",
+        "REMARKABLE_GEMINI_MODEL": "gemini-3.1-pro-preview",
+        "REMARKABLE_TRANSCRIPT_DIR": "/Users/YOU/Documents/reMarkable-transcripts",
+        "REMARKABLE_TRANSCRIPT_LANG": "en"
+      }
+    }
+  }
+}

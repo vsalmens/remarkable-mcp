@@ -604,6 +604,84 @@ choco install tesseract
 
 </details>
 
+### LLM Transcription (Gemini or Claude)
+
+Multimodal LLMs read messy, mixed-language handwriting far better than classic
+OCR. Select one as the backend:
+
+```json
+{
+  "env": {
+    "REMARKABLE_OCR_BACKEND": "gemini",
+    "GEMINI_API_KEY": "your-key",
+    "ANTHROPIC_API_KEY": "your-key",
+    "REMARKABLE_OCR_LANGUAGES": "fi,en"
+  }
+}
+```
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `REMARKABLE_GEMINI_MODEL` | `gemini-3.1-pro-preview` | Gemini model ID |
+| `REMARKABLE_ANTHROPIC_MODEL` | `claude-opus-5-5` | Claude model ID |
+| `ANTHROPIC_WORKSPACE_ID` | unset | Sent as `anthropic-workspace-id` when the key is not scoped to a workspace |
+| `REMARKABLE_OCR_CACHE_DIR` | `~/.remarkable/cache/ocr` | Transcription cache |
+| `REMARKABLE_OCR_CACHE` | `1` | Set `0` to disable the cache |
+
+Each page PNG is transcribed once and cached by content hash, backend, model and
+prompt version, so repeated reads cost nothing. Blank pages are recognised and
+not sent to a fallback backend. If the selected LLM is unavailable, OCR falls
+back to Google Vision (when configured) and then Tesseract.
+
+`remarkable_image(..., include_ocr=True, ocr_backend="anthropic")` overrides the
+backend for one call, which makes side-by-side comparisons easy.
+
+### Background Transcription (dual reading)
+
+`remarkable_transcribe(document, pages="all", mode="dual")` transcribes a whole
+notebook on the server and returns a job id at once; no page images pass through
+the MCP client. Pages without ink are skipped. In `dual` mode Claude and Gemini
+read each page independently and, where they differ, a third pass checks the
+image and writes the final text (`REMARKABLE_ADJUDICATOR`, default `anthropic`).
+`remarkable_transcribe_status(job_id, include_text=True)` reports progress,
+agreement between the readers and the text. Markdown and JSON are written to
+`REMARKABLE_TRANSCRIPT_DIR` (default `~/Documents/reMarkable-transcripts`);
+Markdown labels are English by default (`REMARKABLE_TRANSCRIPT_LANG=fi` for Finnish).
+Transient API errors are retried (`REMARKABLE_OCR_RETRIES`, default 4).
+
+The final text marks uncertainty inline: `{likelier|other}` for two plausible
+readings, `word (?)` for a doubtful one, `[?]` for illegible text. Pass
+`model="gemini-…"` or `model="claude-…"` to try another model for one job; the
+output file name then carries the model so the main transcription stays intact.
+
+**Writer vocabulary.** Names and terms you write often help the final pass pick
+the right reading of a hard word. List them in `~/.remarkable/ocr-vocabulary.txt`
+(one per line or comma-separated, `#` for comments; read on every call, no
+restart needed) or in `REMARKABLE_OCR_VOCABULARY`. The list goes to the
+adjudication pass only, so cached readings stay valid; changing it re-runs the
+adjudication of pages where the readers differed.
+
+### Example configuration
+
+[`examples/claude_desktop_config.example.json`](examples/claude_desktop_config.example.json)
+shows every option added in this fork with placeholder values, and
+[`examples/ocr-vocabulary.example.txt`](examples/ocr-vocabulary.example.txt) a
+vocabulary file. Keep your real configuration (API keys, excluded folders,
+names) outside the repository.
+
+### OCR Language Hints (Google Vision)
+
+Messy handwriting can make Google Vision guess an unrelated script. Pass
+language hints to keep it on track:
+
+```json
+{
+  "env": {
+    "REMARKABLE_OCR_LANGUAGES": "fi,en"
+  }
+}
+```
+
 ### Default Behavior (`auto`)
 
 When `REMARKABLE_OCR_BACKEND=auto` (default):
@@ -803,6 +881,24 @@ Useful for:
 - Focusing on work documents during office hours
 - Separating personal and professional notes
 - Limiting scope for specific AI workflows
+
+### Excluding Folders
+
+Hide specific folders or documents completely. Excluded paths (and everything
+below them) are skipped by browse, search, recent, read, image, export, the
+canvas, and MCP resource registration. Matching is case-insensitive:
+
+```json
+{
+  "env": {
+    "REMARKABLE_EXCLUDE_PATHS": "/Private,/Work/Clients"
+  }
+}
+```
+
+Unlike `REMARKABLE_ROOT_PATH`, which narrows the server to one folder, this
+removes selected folders while keeping the rest of the library visible. Both can
+be combined.
 
 ### Custom Background Color
 

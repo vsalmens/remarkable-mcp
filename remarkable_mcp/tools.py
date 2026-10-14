@@ -7,6 +7,7 @@ file on the MCP server host and returns it as a resource link.
 """
 
 import base64
+import json
 import logging
 import os
 import re
@@ -25,6 +26,7 @@ from mcp.types import (
     ToolAnnotations,
 )
 
+from remarkable_mcp import llm_ocr
 from remarkable_mcp.api import (
     REMARKABLE_TOKEN,
     download_raw_file,
@@ -61,6 +63,8 @@ from remarkable_mcp.extract import (
     render_page_full_page_from_document_zip,
     render_tablet_pdf_page_to_png,
 )
+from remarkable_mcp.llm_ocr import LLM_OCR_BACKENDS
+from remarkable_mcp.policy import is_excluded, vision_request
 from remarkable_mcp.responses import make_error, make_response
 from remarkable_mcp.server import mcp
 
@@ -85,7 +89,12 @@ def _get_root_path() -> str:
 
 
 def _is_within_root(path: str, root: str) -> bool:
-    """Check if a path is within the configured root (case-insensitive)."""
+    """Check if a path is within the configured root (case-insensitive).
+
+    Paths listed in REMARKABLE_EXCLUDE_PATHS are never within root.
+    """
+    if is_excluded(path):
+        return False
     if root == "/":
         return True
     # Path must equal root or be a child of root (case-insensitive)
@@ -303,14 +312,7 @@ def _ocr_png_google_vision(png_path: Path) -> Optional[str]:
             image_content = base64.b64encode(f.read()).decode("utf-8")
 
         url = f"https://vision.googleapis.com/v1/images:annotate?key={api_key}"
-        payload = {
-            "requests": [
-                {
-                    "image": {"content": image_content},
-                    "features": [{"type": "DOCUMENT_TEXT_DETECTION"}],
-                }
-            ]
-        }
+        payload = {"requests": [vision_request(image_content)]}
 
         response = requests.post(url, json=payload, timeout=60)
         if response.status_code == 200:
@@ -1053,6 +1055,12 @@ async def remarkable_browse(
             return make_response(result, hint)
 
         # Browse mode - use actual_path (with root applied)
+        if is_excluded(actual_path):
+            return make_error(
+                error_type="access_denied",
+                message=f"Path '{path}' is excluded by REMARKABLE_EXCLUDE_PATHS.",
+                suggestion="Use remarkable_browse('/') to see accessible folders.",
+            )
         if actual_path == "/" or actual_path == "":
             target_parent = ""
         else:
@@ -1107,15 +1115,16 @@ async def remarkable_browse(
                         return json.dumps(result_data, indent=2)
 
                     # Folder not found - suggest alternatives
-                    available_folders = [
-                        item.VissibleName
+                    visible_children = [
+                        item
                         for item in items_by_parent.get(current_parent, [])
-                        if item.is_folder
+                        if not is_excluded(get_item_path(item, items_by_id))
+                    ]
+                    available_folders = [
+                        item.VissibleName for item in visible_children if item.is_folder
                     ]
                     available_docs = [
-                        item.VissibleName
-                        for item in items_by_parent.get(current_parent, [])
-                        if not item.is_folder
+                        item.VissibleName for item in visible_children if not item.is_folder
                     ]
                     suggestion = "Use remarkable_browse('/') to see root folder contents."
                     if available_docs:
@@ -1144,6 +1153,9 @@ async def remarkable_browse(
         for item in sorted(items, key=lambda x: x.VissibleName.lower()):
             # Skip cloud-archived items
             if _is_cloud_archived(item):
+                continue
+            # Never list excluded folders or documents
+            if is_excluded(get_item_path(item, items_by_id)):
                 continue
             # Filter by tags if provided
             if tags and not item.is_folder:
@@ -1758,6 +1770,7 @@ async def remarkable_image(
     compatibility: bool = False,
     include_ocr: bool = False,
     render_merged: Optional[bool] = None,
+    ocr_backend: Optional[str] = None,
 ):
     """
     <usecase>Get an image of a specific page from a reMarkable document.</usecase>
@@ -1803,6 +1816,9 @@ async def remarkable_image(
     - compatibility: If True, return resource URI in JSON instead of embedded resource.
       Use this if your client doesn't support embedded resources in tool responses.
     - include_ocr: Enable OCR text extraction from the image (default: False).
+    - ocr_backend: Override the OCR backend for this call only: "gemini",
+      "anthropic", "google" or "tesseract" (default: server configuration).
+      Useful for comparing backends on the same page.
     - render_merged: PDF compositing mode for PNG: None (default) automatically
       merges PDF-backed pages, True explicitly requests merging, and False returns
       the annotation-only layer. SVG output remains annotation-only.
@@ -2031,15 +2047,26 @@ async def remarkable_image(
                         ocr_tmp.write(png_data)
                         ocr_tmp_path = Path(ocr_tmp.name)
                     try:
-                        backend = get_ocr_backend()
-                        use_google = backend == "google" or (
-                            backend == "auto" and os.environ.get("GOOGLE_VISION_API_KEY")
+                        backend = (ocr_backend or "").strip().lower() or get_ocr_backend()
+                        llm_done = False
+                        if backend in LLM_OCR_BACKENDS:
+                            llm_text = await run_blocking(llm_ocr.ocr_png, png_data, backend)
+                            if llm_text is not None:
+                                # "" means the model saw a blank page: no fallback
+                                llm_done = True
+                                ocr_backend_used = backend
+                                ocr_text = llm_text or None
+                            else:
+                                backend = "auto"
+                        use_google = not llm_done and (
+                            backend == "google"
+                            or (backend == "auto" and os.environ.get("GOOGLE_VISION_API_KEY"))
                         )
                         if use_google:
                             ocr_text = await run_blocking(_ocr_png_google_vision, ocr_tmp_path)
                             if ocr_text:
                                 ocr_backend_used = "google"
-                        if ocr_text is None:
+                        if ocr_text is None and not llm_done:
                             ocr_text = await run_blocking(_ocr_png_tesseract, ocr_tmp_path)
                             if ocr_text:
                                 ocr_backend_used = "tesseract"
@@ -2542,3 +2569,230 @@ async def remarkable_export(
         },
     )
     return [info, link]
+
+
+# =============================================================================
+# Background transcription (one or two LLM readers, results on disk)
+# =============================================================================
+
+TRANSCRIBE_ANNOTATIONS = ToolAnnotations(
+    title="Transcribe reMarkable Notebook",
+    read_only_hint=False,
+    destructive_hint=False,
+    idempotent_hint=True,
+    open_world_hint=False,
+)
+
+
+def _render_ink_page(zip_path: Path, page: int) -> Optional[bytes]:
+    """Annotation/ink layer only, white background (None = no ink layer)."""
+    return render_page_from_document_zip(zip_path, page, background_color="#FFFFFF")
+
+
+@mcp.tool(annotations=TRANSCRIBE_ANNOTATIONS)
+async def remarkable_transcribe(
+    document: str,
+    pages: str = "all",
+    mode: str = "dual",
+    workers: int = 4,
+    model: Optional[str] = None,
+) -> str:
+    """
+    <usecase>Transcribe a handwritten notebook or PDF annotations in the background.</usecase>
+    <instructions>
+    Starts a background job on the MCP server and returns immediately with a job_id.
+    Pages are rendered and read on the server; no images are sent to the client.
+    Pages without ink are skipped. Results are cached, so re-running is cheap and
+    an interrupted job resumes.
+
+    Modes:
+    - "dual" (default): Claude and Gemini read every page independently; where they
+      differ, a third pass checks the image and writes the final text, marking
+      remaining doubts with (?).
+    - "anthropic" or "gemini": a single reader.
+
+    Poll progress and read results with remarkable_transcribe_status(job_id).
+    The final Markdown and JSON are written to REMARKABLE_TRANSCRIPT_DIR
+    (default ~/Documents/reMarkable-transcripts).
+    </instructions>
+    <parameters>
+    - document: Document name or path
+    - pages: "all" (default) or a spec such as "1-20,35,40-"
+    - mode: "dual" (default), "anthropic" or "gemini"
+    - workers: pages processed in parallel (default 4, max 16)
+    - model: optional model id for this job only, e.g. "gemini-3.8-flash" or
+      "claude-fable-5-1". It replaces the configured model of the matching reader
+      (gemini-… or claude-…). Output files get the model in their name, so an A/B
+      run never overwrites the main transcription.
+    </parameters>
+    <examples>
+    - remarkable_transcribe("Meeting Notes")
+    - remarkable_transcribe("Meeting Notes", pages="1-3", mode="anthropic")
+    - remarkable_transcribe("Sketchbook", pages="1-10", mode="gemini", model="gemini-3.8-flash")
+    </examples>
+    """
+    from remarkable_mcp import transcribe
+
+    try:
+        mode = (mode or "dual").strip().lower()
+        if mode not in transcribe.MODES:
+            return make_error(
+                error_type="invalid_mode",
+                message=f"Unknown mode '{mode}'.",
+                suggestion="Use 'dual', 'anthropic' or 'gemini'.",
+            )
+        models = {}
+        if model and model.strip():
+            backend = llm_ocr.backend_for_model(model)
+            if backend is None or backend not in transcribe.MODES[mode]:
+                return make_error(
+                    error_type="invalid_model",
+                    message=f"Model '{model}' does not match a reader in mode '{mode}'.",
+                    suggestion="Use a gemini-… model with mode gemini/dual, "
+                    "or a claude-… model with mode anthropic/dual.",
+                )
+            models[backend] = model.strip()
+        missing = [b for b in transcribe.MODES[mode] if not llm_ocr.has_credentials(b)]
+        if missing:
+            return make_error(
+                error_type="missing_credentials",
+                message=f"No API key configured for: {', '.join(missing)}.",
+                suggestion="Set ANTHROPIC_API_KEY and/or GEMINI_API_KEY in the MCP config.",
+            )
+
+        client = await run_blocking(get_rmapi)
+        collection = await run_blocking(client.get_meta_items)
+        items_by_id = get_items_by_id(collection)
+        target_doc = _find_target_document(collection, items_by_id, document)
+        if not target_doc:
+            return make_error(
+                error_type="document_not_found",
+                message=f"Document not found: '{document}'",
+                suggestion="Use remarkable_browse() to find the exact name or path.",
+            )
+
+        raw_doc = await run_blocking(client.download, target_doc)
+        if _is_pdf_payload(raw_doc):
+            return make_error(
+                error_type="archive_unavailable",
+                message="This transport returned a flattened PDF without an ink layer.",
+                suggestion="Use the cloud or SSH transport for transcription.",
+            )
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+            tmp.write(raw_doc)
+            tmp_path = Path(tmp.name)
+        try:
+            total = await run_blocking(get_document_page_count, tmp_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+        try:
+            page_list = transcribe.parse_pages(pages, total)
+        except ValueError as e:
+            return make_error(
+                error_type="invalid_pages",
+                message=str(e),
+                suggestion="Use 'all' or e.g. '1-20,35'.",
+            )
+        if not page_list:
+            return make_error(
+                error_type="no_pages",
+                message=f"No pages selected (document has {total}).",
+                suggestion="Check the pages parameter.",
+            )
+
+        job = transcribe.start_job(
+            document=target_doc.VissibleName,
+            path=_apply_root_filter(get_item_path(target_doc, items_by_id)),
+            mode=mode,
+            pages=page_list,
+            total_pages=total,
+            raw_doc=raw_doc,
+            render=_render_ink_page,
+            workers=max(1, min(16, int(workers))),
+            models=models,
+        )
+        return make_response(
+            transcribe.summarize(job),
+            f"Started job {job.id} for {len(page_list)} page(s). "
+            f"Check progress with remarkable_transcribe_status('{job.id}').",
+        )
+    except Exception as e:
+        return make_error(
+            error_type="transcribe_failed",
+            message=str(e),
+            suggestion="Check remarkable_status() and the server log.",
+        )
+
+
+@mcp.tool(annotations=STATUS_ANNOTATIONS)
+async def remarkable_transcribe_status(
+    job_id: Optional[str] = None,
+    include_text: bool = False,
+    pages: Optional[str] = None,
+    disagreements_only: bool = False,
+    max_chars: int = 20000,
+) -> str:
+    """
+    <usecase>Check a transcription job and optionally read its text.</usecase>
+    <instructions>
+    Without job_id, lists all jobs in this server process. With job_id, returns
+    progress counts (done, blank, failed, pending), mean agreement between the two
+    readers, pages below 80 % agreement and the output file paths.
+
+    include_text=True adds per-page text (final, plus both readings in dual mode),
+    limited to max_chars. Narrow with pages="1-20" or disagreements_only=True
+    (pages where the readers differed or the final text carries uncertainty
+    markers).
+
+    Dual-mode final text marks uncertainty inline: {likelier|other} for two
+    plausible readings, word (?) for a doubtful reading, [?] for illegible.
+    Each dual page also reports these counts under "uncertainty" and the
+    option groups under "alternatives".
+    </instructions>
+    """
+    from remarkable_mcp import transcribe
+
+    if not job_id:
+        jobs = [transcribe.summarize(j) for j in transcribe.list_jobs()]
+        return make_response({"jobs": jobs}, f"{len(jobs)} job(s).")
+    job = transcribe.get_job(job_id)
+    if not job:
+        return make_error(
+            error_type="job_not_found",
+            message=f"No job '{job_id}' in this server process.",
+            suggestion="Jobs end with a server restart; start again (the cache makes it fast).",
+        )
+    data = transcribe.summarize(job)
+    if include_text:
+        wanted = set(transcribe.parse_pages(pages, job.total_pages)) if pages else None
+        budget = max(1000, int(max_chars))
+        out = []
+        truncated = False
+        for p in sorted(job.results):
+            r = job.results[p]
+            if r.status not in ("done", "failed"):
+                continue
+            if wanted is not None and p not in wanted:
+                continue
+            if disagreements_only and (r.agreement is None or r.agreement >= 0.999):
+                if not any(transcribe.uncertainty(r.final).values()):
+                    continue
+            entry = {"page": p, "status": r.status, "final": r.final}
+            if job.mode == "dual":
+                entry["agreement"] = r.agreement
+                entry["uncertainty"] = transcribe.uncertainty(r.final)
+                entry["alternatives"] = transcribe.alternatives(r.final)
+                entry["readings"] = r.readings
+            if r.error:
+                entry["error"] = r.error
+            size = len(json.dumps(entry, ensure_ascii=False))
+            if size > budget:
+                truncated = True
+                break
+            budget -= size
+            out.append(entry)
+        data["pages"] = out
+        if truncated:
+            data["truncated"] = True
+    hint = f"Job {job.id}: {data['state']}, {data['done']} done, {data['pending']} pending."
+    return make_response(data, hint)
