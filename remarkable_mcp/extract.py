@@ -1902,6 +1902,28 @@ def render_merged_page_from_extracted_document(
         return annotation_only("Compositing failed")
 
 
+def get_page_ids_from_zip(zip_path: Path) -> List[Optional[str]]:
+    """Stable page ids of a document zip, in page order (None where unknown).
+
+    The ids come from the .content file (``cPages.pages[].id`` in format 2, the
+    ``pages`` list in format 1). They survive pages being inserted or removed,
+    unlike page numbers. The list is aligned with get_document_page_count.
+    """
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            name = next((n for n in zf.namelist() if n.endswith(".content")), None)
+            if name is None:
+                return []
+            data = json.loads(zf.read(name))
+    except Exception:
+        return []
+    if isinstance(data.get("cPages"), dict) and isinstance(data["cPages"].get("pages"), list):
+        return [p.get("id") if isinstance(p, dict) else None for p in data["cPages"]["pages"]]
+    if isinstance(data.get("pages"), list):
+        return [p if isinstance(p, str) else None for p in data["pages"]]
+    return []
+
+
 def get_document_page_count(zip_path: Path) -> int:
     """
     Get the number of pages in a reMarkable document zip.

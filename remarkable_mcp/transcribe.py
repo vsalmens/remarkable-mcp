@@ -11,6 +11,12 @@ a job is cheap and an interrupted job resumes where it stopped.
 Results are written as Markdown (+ JSON) under REMARKABLE_TRANSCRIPT_DIR
 (default ~/Documents/reMarkable-transcripts). Markdown labels follow
 REMARKABLE_TRANSCRIPT_LANG ("en" default, "fi").
+
+A library index (_library.json in the same folder) records, per document id,
+the modification time that was last transcribed in full and whether the
+document is still on the tablet. remarkable_transcribe_sync uses it to
+transcribe only new and changed documents; transcripts of documents removed
+from the tablet stay where they are and are marked "removed".
 """
 
 from __future__ import annotations
@@ -72,6 +78,13 @@ class Job:
     task: Optional[asyncio.Task] = None
     # backend -> model override; "judge" -> adjudication model
     models: Dict[str, str] = field(default_factory=dict)
+    document_id: Optional[str] = None
+    modified: Optional[str] = None  # document modification time (ISO 8601)
+    page_ids: List[Optional[str]] = field(default_factory=list)  # stable ids, page order
+    usage: Dict[str, dict] = field(default_factory=dict)  # model -> calls/tokens
+
+    def page_id(self, page: int) -> Optional[str]:
+        return self.page_ids[page - 1] if 0 < page <= len(self.page_ids) else None
 
 
 # ---------------------------------------------------------------------------
@@ -347,11 +360,16 @@ def write_outputs(job: Job) -> None:
             {
                 "document": job.document,
                 "path": job.path,
+                "document_id": job.document_id,
+                "modified": job.modified,
                 "mode": job.mode,
                 "models": job.models,
+                "usage": job.usage,
+                "estimated_cost_usd": llm_ocr.estimate_cost(job.usage),
                 "notation": NOTATION,
                 "pages": {
                     str(p): {
+                        "page_id": job.page_id(p),
                         "status": r.status,
                         "final": r.final,
                         "readings": r.readings,
@@ -385,6 +403,7 @@ async def _read_page(job: Job, zip_path: Path, page: int, render, sem) -> None:
     from remarkable_mcp.concurrency import run_blocking
 
     r = job.results[page]
+    llm_ocr.USAGE_SINK.set(job.usage)  # this task's context; copied into worker threads
     async with sem:
         try:
             png = await run_blocking(render, zip_path, page)
@@ -441,6 +460,7 @@ async def _adjudicate_page(job: Job, zip_path: Path, page: int, render, sem) -> 
     from remarkable_mcp.concurrency import run_blocking
 
     r = job.results[page]
+    llm_ocr.USAGE_SINK.set(job.usage)
     async with sem:
         try:
             png = await run_blocking(render, zip_path, page)
@@ -473,6 +493,10 @@ async def run_job(job: Job, raw_doc: bytes, render, workers: int) -> None:
         if any(r.status != "blank" for r in job.results.values()):
             write_outputs(job)  # a document without handwriting leaves no files behind
         job.state = "done"
+        try:
+            record_in_index(job)
+        except Exception as e:  # the transcript is written; the index can catch up later
+            logger.warning("Could not update the library index: %s", e)
     except Exception as e:
         logger.warning("Transcription job %s failed: %s", job.id, e)
         job.state = "failed"
@@ -498,6 +522,9 @@ def start_job(
     render,
     workers: int,
     models: Optional[Dict[str, str]] = None,
+    document_id: Optional[str] = None,
+    modified: Optional[str] = None,
+    page_ids: Optional[List[Optional[str]]] = None,
 ) -> Job:
     job = Job(
         id=uuid.uuid4().hex[:8],
@@ -507,6 +534,9 @@ def start_job(
         pages=pages,
         total_pages=total_pages,
         models=dict(models or {}),
+        document_id=document_id,
+        modified=modified,
+        page_ids=list(page_ids or []),
     )
     job.results = {p: PageResult(page=p) for p in pages}
     _JOBS[job.id] = job
@@ -572,6 +602,11 @@ def summarize(job: Job) -> dict:
         and all(r.status == "blank" for r in job.results.values())
     ):
         out["no_handwriting"] = True
+    if job.usage:
+        out["usage"] = job.usage
+        cost = llm_ocr.estimate_cost(job.usage)
+        if cost is not None:
+            out["estimated_cost_usd"] = cost
     if job.output_md:
         out["output_markdown"] = job.output_md
         out["output_json"] = job.output_json
@@ -580,4 +615,203 @@ def summarize(job: Job) -> dict:
     failed = [r.page for r in job.results.values() if r.status == "failed"]
     if failed:
         out["failed_pages"] = failed
+    return out
+
+
+def brief(job: Job) -> dict:
+    """One line per job for listings."""
+    counts = {"done": 0, "blank": 0, "failed": 0, "pending": 0}
+    for r in job.results.values():
+        counts[r.status] = counts.get(r.status, 0) + 1
+    out = {"job_id": job.id, "path": job.path, "state": job.state, **counts}
+    cost = llm_ocr.estimate_cost(job.usage) if job.usage else None
+    if cost is not None:
+        out["estimated_cost_usd"] = cost
+    return out
+
+
+# ---------------------------------------------------------------------------
+# library index and sync runs
+# ---------------------------------------------------------------------------
+
+INDEX_NAME = "_library.json"
+
+
+def index_path() -> Path:
+    return transcript_dir() / INDEX_NAME
+
+
+def load_index() -> dict:
+    path = index_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("documents"), dict):
+            return data
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as e:
+        logger.warning("Library index unreadable, starting a new one: %s", e)
+    return {"documents": {}}
+
+
+def save_index(index: dict) -> None:
+    path = index_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    index["updated"] = datetime.now().isoformat(timespec="seconds")
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".library-", suffix=".json")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(index, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def _is_main_run(job: Job) -> bool:
+    """Full document with the configured models: the transcript the index tracks."""
+    if "judge" in job.models or len(job.pages) != job.total_pages:
+        return False
+    return all(job.models.get(b) in (None, llm_ocr._model_for(b)) for b in MODES[job.mode])
+
+
+def record_in_index(job: Job) -> None:
+    if not job.document_id or job.state != "done" or not _is_main_run(job):
+        return
+    if any(r.status == "failed" for r in job.results.values()):
+        return  # leave it marked as changed so the next sync retries
+    index = load_index()
+    index["documents"][job.document_id] = {
+        "document": job.document,
+        "path": job.path,
+        "modified": job.modified,
+        "status": "on_device",
+        "transcribed": datetime.now().isoformat(timespec="seconds"),
+        "mode": job.mode,
+        "pages_with_text": sum(1 for r in job.results.values() if r.status == "done"),
+        "no_handwriting": all(r.status == "blank" for r in job.results.values()),
+        "output_markdown": job.output_md,
+        "output_json": job.output_json,
+    }
+    save_index(index)
+
+
+def plan_sync(documents: List[dict], index: dict) -> dict:
+    """Compare the tablet's documents with the index.
+
+    ``documents`` holds {"id", "path", "modified"} for every document that may
+    be transcribed. Returns the new and changed ones, how many are unchanged,
+    and the indexed documents that are no longer on the tablet.
+    """
+    known = index.get("documents", {})
+    new, changed, unchanged = [], [], 0
+    for doc in documents:
+        entry = known.get(doc["id"])
+        if entry is None:
+            new.append(doc)
+        elif entry.get("modified") != doc["modified"] or entry.get("status") != "on_device":
+            changed.append(doc)
+        else:
+            unchanged += 1
+    present = {doc["id"] for doc in documents}
+    removed = [
+        {"id": doc_id, "path": entry.get("path")}
+        for doc_id, entry in known.items()
+        if doc_id not in present and entry.get("status") == "on_device"
+    ]
+    return {"new": new, "changed": changed, "unchanged": unchanged, "removed": removed}
+
+
+def mark_removed(doc_ids: List[str]) -> None:
+    if not doc_ids:
+        return
+    index = load_index()
+    stamp = datetime.now().isoformat(timespec="seconds")
+    for doc_id in doc_ids:
+        entry = index["documents"].get(doc_id)
+        if entry is not None:
+            entry["status"] = "removed"
+            entry["removed"] = stamp
+    save_index(index)
+
+
+@dataclass
+class SyncRun:
+    id: str
+    planned: List[dict]
+    removed: List[dict]
+    unchanged: int
+    started: float = field(default_factory=time.time)
+    finished: Optional[float] = None
+    state: str = "running"
+    job_ids: List[str] = field(default_factory=list)
+    errors: List[dict] = field(default_factory=list)
+    task: Optional[asyncio.Task] = None
+
+
+_SYNCS: Dict[str, SyncRun] = {}
+
+
+def start_sync(planned: List[dict], removed: List[dict], unchanged: int, launch, parallel: int):
+    """Transcribe ``planned`` documents in the background, ``parallel`` at a time.
+
+    ``launch(doc)`` is an async callable that starts a job for one document and
+    returns it (or raises).
+    """
+    run = SyncRun(
+        id="sync-" + uuid.uuid4().hex[:6], planned=planned, removed=removed, unchanged=unchanged
+    )
+    _SYNCS[run.id] = run
+    mark_removed([d["id"] for d in removed])
+
+    async def one(doc, sem):
+        async with sem:
+            try:
+                job = await launch(doc)
+                run.job_ids.append(job.id)
+                await job.task
+            except Exception as e:
+                logger.warning("Sync of %s failed: %s", doc.get("path"), e)
+                run.errors.append({"path": doc.get("path"), "error": str(e)})
+
+    async def go():
+        sem = asyncio.Semaphore(max(1, parallel))
+        await asyncio.gather(*(one(doc, sem) for doc in planned))
+        run.state = "done"
+        run.finished = time.time()
+
+    run.task = asyncio.get_running_loop().create_task(go())
+    return run
+
+
+def get_sync(sync_id: str) -> Optional[SyncRun]:
+    return _SYNCS.get(sync_id)
+
+
+def list_syncs() -> List[SyncRun]:
+    return list(_SYNCS.values())
+
+
+def summarize_sync(run: SyncRun) -> dict:
+    jobs = [j for j in (get_job(i) for i in run.job_ids) if j is not None]
+    usage: Dict[str, dict] = {}
+    for job in jobs:
+        for model, entry in job.usage.items():
+            total = usage.setdefault(model, {"calls": 0, "input_tokens": 0, "output_tokens": 0})
+            for key in total:
+                total[key] += entry.get(key, 0)
+    out = {
+        "sync_id": run.id,
+        "state": run.state,
+        "documents_planned": len(run.planned),
+        "documents_finished": sum(1 for j in jobs if j.finished is not None),
+        "unchanged": run.unchanged,
+        "removed_from_tablet": [d["path"] for d in run.removed],
+        "pages_transcribed": sum(1 for j in jobs for r in j.results.values() if r.status == "done"),
+        "elapsed_seconds": round((run.finished or time.time()) - run.started),
+        "jobs": [brief(j) for j in jobs],
+    }
+    if usage:
+        out["usage"] = usage
+        cost = llm_ocr.estimate_cost(usage)
+        if cost is not None:
+            out["estimated_cost_usd"] = cost
+    if run.errors:
+        out["errors"] = run.errors
     return out

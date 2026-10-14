@@ -17,16 +17,26 @@ Cache
     REMARKABLE_OCR_CACHE_DIR    default: ~/.remarkable/cache/ocr
     REMARKABLE_OCR_CACHE=0      disables the cache
 
+Usage
+    Token counts of real API calls (cache hits cost nothing) are added to the
+    dict in USAGE_SINK, if one is set for the current context. Transcription
+    jobs use this to report tokens and an estimated cost per job.
+    REMARKABLE_PRICES  optional JSON {"model": [input_usd, output_usd]} per
+                       million tokens, overriding the list prices below.
+
 Language hints come from REMARKABLE_OCR_LANGUAGES (see policy.py).
 """
 
 from __future__ import annotations
 
 import base64
+import contextvars
 import hashlib
+import json
 import logging
 import os
 import tempfile
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -35,6 +45,55 @@ from remarkable_mcp.policy import get_ocr_language_hints
 logger = logging.getLogger(__name__)
 
 LLM_OCR_BACKENDS = ("gemini", "anthropic")
+
+# USD per million tokens (input, output). List prices as of October 2026;
+# models not listed get token counts only. Override with REMARKABLE_PRICES.
+LIST_PRICES = {
+    "claude-opus-5-5": (4.0, 20.0),
+    "claude-sonnet-5-5": (2.0, 10.0),
+    "claude-haiku-5-5": (0.10, 0.50),
+}
+
+USAGE_SINK: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
+    "remarkable_ocr_usage", default=None
+)
+_usage_lock = threading.Lock()
+
+
+def _record_usage(model: str, input_tokens: int, output_tokens: int) -> None:
+    sink = USAGE_SINK.get()
+    if sink is None:
+        return
+    with _usage_lock:
+        entry = sink.setdefault(model, {"calls": 0, "input_tokens": 0, "output_tokens": 0})
+        entry["calls"] += 1
+        entry["input_tokens"] += int(input_tokens or 0)
+        entry["output_tokens"] += int(output_tokens or 0)
+
+
+def _prices() -> dict:
+    prices = dict(LIST_PRICES)
+    raw = os.environ.get("REMARKABLE_PRICES", "").strip()
+    if raw:
+        try:
+            for model, pair in json.loads(raw).items():
+                prices[model] = (float(pair[0]), float(pair[1]))
+        except (ValueError, TypeError, IndexError, AttributeError):
+            logger.warning("Ignoring malformed REMARKABLE_PRICES")
+    return prices
+
+
+def estimate_cost(usage: dict) -> Optional[float]:
+    """Estimated USD for a usage dict, or None if no model in it has a price."""
+    prices = _prices()
+    total, priced = 0.0, False
+    for model, entry in usage.items():
+        if model in prices:
+            pin, pout = prices[model]
+            total += (entry["input_tokens"] * pin + entry["output_tokens"] * pout) / 1e6
+            priced = True
+    return round(total, 4) if priced else None
+
 
 DEFAULT_MODELS = {
     "gemini": "gemini-3.1-pro-preview",
@@ -166,6 +225,12 @@ def _call_gemini(png: bytes, model: str, prompt: str, timeout: float) -> Optiona
         )
         return None
     data = resp.json()
+    meta = data.get("usageMetadata") or {}
+    _record_usage(
+        model,
+        meta.get("promptTokenCount", 0),
+        meta.get("candidatesTokenCount", 0) + meta.get("thoughtsTokenCount", 0),
+    )
     texts = []
     for cand in data.get("candidates", [])[:1]:
         for part in cand.get("content", {}).get("parts", []):
@@ -219,6 +284,14 @@ def _call_anthropic(png: bytes, model: str, prompt: str, timeout: float) -> Opti
         )
         return None
     data = resp.json()
+    used = data.get("usage") or {}
+    _record_usage(
+        model,
+        used.get("input_tokens", 0)
+        + used.get("cache_creation_input_tokens", 0)
+        + used.get("cache_read_input_tokens", 0),
+        used.get("output_tokens", 0),
+    )
     texts = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
     return "".join(texts) if texts else None
 

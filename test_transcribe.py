@@ -430,3 +430,176 @@ def test_document_without_handwriting_writes_no_files(tmp_path):
     assert "output_markdown" not in s and adj.call_count == 0
     out = tmp_path / "out"
     assert not out.exists() or not any(out.iterdir())
+
+
+def test_usage_reaches_the_job_through_worker_threads():
+    from remarkable_mcp import llm_ocr
+
+    def ocr(png, backend):
+        llm_ocr._record_usage("claude-opus-5-5" if backend == "anthropic" else "g", 1000, 100)
+        return "same"
+
+    job, _ = _run(
+        dict(document="D", path="/D", mode="dual", pages=[1, 2], total_pages=2, workers=2),
+        {1: INK, 2: INK},
+        ocr,
+    )
+    assert job.usage["claude-opus-5-5"] == {"calls": 2, "input_tokens": 2000, "output_tokens": 200}
+    assert job.usage["g"]["calls"] == 2
+    s = transcribe.summarize(job)
+    assert s["estimated_cost_usd"] == pytest.approx((2000 * 4 + 200 * 20) / 1e6)
+    data = json.load(open(s["output_json"], encoding="utf-8"))
+    assert data["usage"]["g"]["input_tokens"] == 2000
+    assert transcribe.brief(job)["estimated_cost_usd"] == s["estimated_cost_usd"]
+
+
+def test_price_override(monkeypatch):
+    from remarkable_mcp import llm_ocr
+
+    usage = {"gemini-4-argon": {"calls": 1, "input_tokens": 1_000_000, "output_tokens": 0}}
+    assert llm_ocr.estimate_cost(usage) is None
+    monkeypatch.setenv("REMARKABLE_PRICES", '{"gemini-4-argon": [1.5, 9]}')
+    assert llm_ocr.estimate_cost(usage) == 1.5
+
+
+def test_page_ids_and_document_id_in_json(tmp_path):
+    job, _ = _run(
+        dict(
+            document="D",
+            path="/D",
+            mode="gemini",
+            pages=[1, 2],
+            total_pages=2,
+            workers=1,
+            document_id="doc-9",
+            modified="2026-10-14T10:00:00",
+            page_ids=["p-a", "p-b"],
+        ),
+        {1: INK, 2: INK},
+        lambda png, b: "text",
+    )
+    data = json.load(open(transcribe.summarize(job)["output_json"], encoding="utf-8"))
+    assert data["document_id"] == "doc-9" and data["modified"] == "2026-10-14T10:00:00"
+    assert [data["pages"][k]["page_id"] for k in ("1", "2")] == ["p-a", "p-b"]
+
+
+def test_page_ids_from_zip(tmp_path):
+    import zipfile
+
+    from remarkable_mcp.extract import get_page_ids_from_zip
+
+    z = tmp_path / "d.zip"
+    with zipfile.ZipFile(z, "w") as zf:
+        zf.writestr(
+            "x.content", json.dumps({"cPages": {"pages": [{"id": "a"}, {"idx": 1}, {"id": "c"}]}})
+        )
+    assert get_page_ids_from_zip(z) == ["a", None, "c"]
+    with zipfile.ZipFile(z, "w") as zf:
+        zf.writestr("x.content", json.dumps({"pages": ["p1", "p2"]}))
+    assert get_page_ids_from_zip(z) == ["p1", "p2"]
+
+
+def test_index_records_only_main_full_runs():
+    base = dict(document="D", path="/D", mode="dual", total_pages=1, workers=1)
+    _run(dict(base, pages=[1], document_id="a", modified="m1"), {1: INK}, lambda png, b: "x")
+    _run(
+        dict(base, pages=[1], document_id="b", modified="m1", models={"judge": "gemini-x"}),
+        {1: INK},
+        lambda png, b: "x",
+    )
+    _run(
+        dict(base, pages=[1], total_pages=2, document_id="c", modified="m1"),
+        {1: INK},
+        lambda png, b: "x",
+    )
+    _run(dict(base, pages=[1], document_id="e", modified="m1"), {1: BLANK}, lambda png, b: "x")
+    docs = transcribe.load_index()["documents"]
+    assert set(docs) == {"a", "e"}
+    assert docs["a"]["modified"] == "m1" and docs["a"]["status"] == "on_device"
+    assert docs["e"]["no_handwriting"] is True and docs["e"]["output_markdown"] is None
+
+
+def test_plan_sync_and_mark_removed():
+    index = {
+        "documents": {
+            "same": {"modified": "1", "status": "on_device", "path": "/S"},
+            "edited": {"modified": "1", "status": "on_device", "path": "/E"},
+            "gone": {"modified": "1", "status": "on_device", "path": "/G"},
+            "back": {"modified": "1", "status": "removed", "path": "/B"},
+        }
+    }
+    docs = [
+        {"id": "same", "path": "/S", "modified": "1"},
+        {"id": "edited", "path": "/E", "modified": "2"},
+        {"id": "back", "path": "/B", "modified": "1"},
+        {"id": "fresh", "path": "/F", "modified": "1"},
+    ]
+    plan = transcribe.plan_sync(docs, index)
+    assert [d["id"] for d in plan["new"]] == ["fresh"]
+    assert [d["id"] for d in plan["changed"]] == ["edited", "back"]
+    assert plan["unchanged"] == 1 and plan["removed"] == [{"id": "gone", "path": "/G"}]
+    transcribe.save_index(index)
+    transcribe.mark_removed(["gone"])
+    assert transcribe.load_index()["documents"]["gone"]["status"] == "removed"
+
+
+@pytest.mark.asyncio
+@patch("remarkable_mcp.tools.get_rmapi")
+async def test_sync_tool_transcribes_only_changes(mock_get_rmapi, monkeypatch):
+    from remarkable_mcp import notebooks
+    from test_server import _call_tool, _make_notebook_zip
+
+    monkeypatch.setenv("REMARKABLE_EXCLUDE_PATHS", "/Private")
+    folder = Mock(
+        ID="f", VissibleName="Private", Parent="", is_folder=True, is_cloud_archived=False
+    )
+    secret = Mock(
+        ID="s",
+        VissibleName="Ledger",
+        Parent="f",
+        is_folder=False,
+        is_cloud_archived=False,
+        ModifiedClient="2026-10-01T00:00:00",
+    )
+    doc = Mock(
+        ID="doc-1",
+        VissibleName="Notes",
+        Parent="",
+        is_folder=False,
+        is_cloud_archived=False,
+        ModifiedClient="2026-10-13T10:00:00",
+    )
+    client = Mock(get_meta_items=Mock(return_value=[folder, secret, doc]))
+    client.download.return_value = _make_notebook_zip(notebooks.page_rm_bytes("Hello ink"))
+    mock_get_rmapi.return_value = client
+
+    async def call(args):
+        res = await _call_tool("remarkable_transcribe_sync", args)
+        return json.loads(res.content[0].text)
+
+    with (
+        patch("remarkable_mcp.llm_ocr.ocr_png", side_effect=lambda png, b, *a: f"{b} text"),
+        patch("remarkable_mcp.llm_ocr.adjudicate_png", return_value="final text"),
+    ):
+        plan = await call({"dry_run": True})
+        assert plan["new"] == ["/Notes"] and plan["unchanged"] == 0
+        started = await call({})
+        run = transcribe.get_sync(started["sync_id"])
+        await run.task
+        assert client.download.call_count == 1  # the excluded document is never downloaded
+        status = await _call_tool("remarkable_transcribe_status", {"job_id": run.id})
+        s = json.loads(status.content[0].text)
+        assert s["state"] == "done" and s["documents_finished"] == 1 and s["pages_transcribed"] >= 1
+
+        again = await call({"dry_run": True})
+        assert again["new"] == [] and again["changed"] == [] and again["unchanged"] == 1
+
+        doc.ModifiedClient = "2026-10-14T09:00:00"
+        assert (await call({"dry_run": True}))["changed"] == ["/Notes"]
+
+        client.get_meta_items.return_value = [folder, secret]
+        gone = await call({})
+        assert gone["removed_from_tablet"] == ["/Notes"]
+    entry = transcribe.load_index()["documents"]["doc-1"]
+    assert entry["status"] == "removed" and entry["output_markdown"]
+    assert "s" not in transcribe.load_index()["documents"]

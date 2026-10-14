@@ -56,6 +56,7 @@ from remarkable_mcp.extract import (
     get_document_file_type,
     get_document_page_count,
     get_ocr_backend,
+    get_page_ids_from_zip,
     render_mapped_pdf_page_from_document_zip,
     render_merged_page_from_document_zip,
     render_page_from_document_zip,
@@ -2589,6 +2590,74 @@ def _render_ink_page(zip_path: Path, page: int) -> Optional[bytes]:
     return render_page_from_document_zip(zip_path, page, background_color="#FFFFFF")
 
 
+class _TranscribeRefused(Exception):
+    """A document that cannot be transcribed, with a user-facing reason."""
+
+    def __init__(self, error_type: str, message: str, suggestion: str):
+        super().__init__(message)
+        self.error_type, self.message, self.suggestion = error_type, message, suggestion
+
+    def response(self) -> str:
+        return make_error(
+            error_type=self.error_type, message=self.message, suggestion=self.suggestion
+        )
+
+
+def _modified_iso(item) -> Optional[str]:
+    modified = getattr(item, "ModifiedClient", None)
+    if isinstance(modified, datetime):
+        return modified.isoformat()
+    return str(modified) if modified else None
+
+
+def _page_count_and_ids(raw_doc: bytes):
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+        tmp.write(raw_doc)
+        tmp_path = Path(tmp.name)
+    try:
+        return get_document_page_count(tmp_path), get_page_ids_from_zip(tmp_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+async def _start_transcription(
+    client, target_doc, items_by_id, *, pages: str, mode: str, workers: int, models: dict
+):
+    """Download a document and start its transcription job (raises _TranscribeRefused)."""
+    from remarkable_mcp import transcribe
+
+    raw_doc = await run_blocking(client.download, target_doc)
+    if _is_pdf_payload(raw_doc):
+        raise _TranscribeRefused(
+            "archive_unavailable",
+            "This transport returned a flattened PDF without an ink layer.",
+            "Use the cloud or SSH transport for transcription.",
+        )
+    total, page_ids = await run_blocking(_page_count_and_ids, raw_doc)
+    try:
+        page_list = transcribe.parse_pages(pages, total)
+    except ValueError as e:
+        raise _TranscribeRefused("invalid_pages", str(e), "Use 'all' or e.g. '1-20,35'.")
+    if not page_list:
+        raise _TranscribeRefused(
+            "no_pages", f"No pages selected (document has {total}).", "Check the pages parameter."
+        )
+    return transcribe.start_job(
+        document=target_doc.VissibleName,
+        path=_apply_root_filter(get_item_path(target_doc, items_by_id)),
+        mode=mode,
+        pages=page_list,
+        total_pages=total,
+        raw_doc=raw_doc,
+        render=_render_ink_page,
+        workers=max(1, min(16, int(workers))),
+        models=models,
+        document_id=getattr(target_doc, "ID", None),
+        modified=_modified_iso(target_doc),
+        page_ids=page_ids,
+    )
+
+
 @mcp.tool(annotations=TRANSCRIBE_ANNOTATIONS)
 async def remarkable_transcribe(
     document: str,
@@ -2625,6 +2694,9 @@ async def remarkable_transcribe(
       "claude-fable-5-1". It replaces the configured model of the matching reader
       (gemini-… or claude-…). Output files get the model in their name, so an A/B
       run never overwrites the main transcription.
+    - judge: optional model for the final pass in dual mode (gemini-… or claude-…).
+      The final pass sees the previous and next page as context; that context may
+      only suggest a reading (word→suggestion (?)), never replace one.
     </parameters>
     <examples>
     - remarkable_transcribe("Meeting Notes")
@@ -2680,54 +2752,155 @@ async def remarkable_transcribe(
                 suggestion="Use remarkable_browse() to find the exact name or path.",
             )
 
-        raw_doc = await run_blocking(client.download, target_doc)
-        if _is_pdf_payload(raw_doc):
-            return make_error(
-                error_type="archive_unavailable",
-                message="This transport returned a flattened PDF without an ink layer.",
-                suggestion="Use the cloud or SSH transport for transcription.",
-            )
-        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
-            tmp.write(raw_doc)
-            tmp_path = Path(tmp.name)
         try:
-            total = await run_blocking(get_document_page_count, tmp_path)
-        finally:
-            tmp_path.unlink(missing_ok=True)
-        try:
-            page_list = transcribe.parse_pages(pages, total)
-        except ValueError as e:
-            return make_error(
-                error_type="invalid_pages",
-                message=str(e),
-                suggestion="Use 'all' or e.g. '1-20,35'.",
+            job = await _start_transcription(
+                client,
+                target_doc,
+                items_by_id,
+                pages=pages,
+                mode=mode,
+                workers=workers,
+                models=models,
             )
-        if not page_list:
-            return make_error(
-                error_type="no_pages",
-                message=f"No pages selected (document has {total}).",
-                suggestion="Check the pages parameter.",
-            )
-
-        job = transcribe.start_job(
-            document=target_doc.VissibleName,
-            path=_apply_root_filter(get_item_path(target_doc, items_by_id)),
-            mode=mode,
-            pages=page_list,
-            total_pages=total,
-            raw_doc=raw_doc,
-            render=_render_ink_page,
-            workers=max(1, min(16, int(workers))),
-            models=models,
-        )
+        except _TranscribeRefused as refused:
+            return refused.response()
         return make_response(
             transcribe.summarize(job),
-            f"Started job {job.id} for {len(page_list)} page(s). "
+            f"Started job {job.id} for {len(job.pages)} page(s). "
             f"Check progress with remarkable_transcribe_status('{job.id}').",
         )
     except Exception as e:
         return make_error(
             error_type="transcribe_failed",
+            message=str(e),
+            suggestion="Check remarkable_status() and the server log.",
+        )
+
+
+@mcp.tool(annotations=TRANSCRIBE_ANNOTATIONS)
+async def remarkable_transcribe_sync(
+    dry_run: bool = False,
+    folder: Optional[str] = None,
+    mode: str = "dual",
+    parallel: int = 2,
+    workers: int = 4,
+) -> str:
+    """
+    <usecase>Keep transcripts in step with the tablet: transcribe only what changed.</usecase>
+    <instructions>
+    Compares every document on the tablet (excluded folders skipped) with the
+    library index (_library.json in REMARKABLE_TRANSCRIPT_DIR) and transcribes
+    the new documents and those modified since their last full transcription.
+    Unchanged pages come from the cache, so a changed document costs only its
+    new or edited pages. Documents without handwriting (e.g. unannotated PDFs)
+    are recorded but leave no transcript files.
+
+    Documents that are no longer on the tablet are marked "removed" in the
+    index; their transcripts are kept. Nothing on the tablet is changed.
+
+    Returns a sync id at once; follow it with remarkable_transcribe_status(sync_id).
+    dry_run=True only reports what would be transcribed.
+    </instructions>
+    <parameters>
+    - dry_run: report the plan without transcribing (default False)
+    - folder: limit to one folder, e.g. "/Journal" (default: whole library)
+    - mode: "dual" (default), "anthropic" or "gemini"
+    - parallel: documents transcribed at the same time (default 2, max 8)
+    - workers: pages per document in parallel (default 4, max 16)
+    </parameters>
+    <examples>
+    - remarkable_transcribe_sync(dry_run=True)
+    - remarkable_transcribe_sync()
+    - remarkable_transcribe_sync(folder="/Journal")
+    </examples>
+    """
+    from remarkable_mcp import transcribe
+
+    try:
+        mode = (mode or "dual").strip().lower()
+        if mode not in transcribe.MODES:
+            return make_error(
+                error_type="invalid_mode",
+                message=f"Unknown mode '{mode}'.",
+                suggestion="Use 'dual', 'anthropic' or 'gemini'.",
+            )
+        missing = [b for b in transcribe.MODES[mode] if not llm_ocr.has_credentials(b)]
+        if missing and not dry_run:
+            return make_error(
+                error_type="missing_credentials",
+                message=f"No API key configured for: {', '.join(missing)}.",
+                suggestion="Set ANTHROPIC_API_KEY and/or GEMINI_API_KEY in the MCP config.",
+            )
+
+        client = await run_blocking(get_rmapi)
+        collection = await run_blocking(client.get_meta_items)
+        items_by_id = get_items_by_id(collection)
+        root = _get_root_path()
+        scope = _resolve_root_path(folder.rstrip("/")).lower() if folder and folder != "/" else None
+
+        documents, by_id = [], {}
+        for item in collection:
+            if item.is_folder or _is_cloud_archived(item):
+                continue
+            full_path = get_item_path(item, items_by_id)
+            if not _is_within_root(full_path, root):
+                continue  # outside the root or in an excluded folder
+            if scope and not (
+                full_path.lower() == scope or full_path.lower().startswith(scope + "/")
+            ):
+                continue
+            documents.append(
+                {
+                    "id": item.ID,
+                    "path": _apply_root_filter(full_path),
+                    "modified": _modified_iso(item),
+                }
+            )
+            by_id[item.ID] = item
+
+        index = transcribe.load_index()
+        plan = transcribe.plan_sync(documents, index)
+        if scope:
+            plan["removed"] = []  # a partial view cannot tell what left the tablet
+        todo = plan["new"] + plan["changed"]
+        summary = {
+            "new": [d["path"] for d in plan["new"]],
+            "changed": [d["path"] for d in plan["changed"]],
+            "unchanged": plan["unchanged"],
+            "removed_from_tablet": [d["path"] for d in plan["removed"]],
+        }
+        if dry_run or not todo:
+            if not dry_run:
+                transcribe.mark_removed([d["id"] for d in plan["removed"]])
+            hint = f"{len(todo)} document(s) to transcribe, {plan['unchanged']} unchanged."
+            return make_response({"dry_run": dry_run, **summary}, hint)
+
+        async def launch(doc):
+            return await _start_transcription(
+                client,
+                by_id[doc["id"]],
+                items_by_id,
+                pages="all",
+                mode=mode,
+                workers=workers,
+                models={},
+            )
+
+        run = transcribe.start_sync(
+            todo,
+            plan["removed"],
+            plan["unchanged"],
+            launch,
+            parallel=max(1, min(8, int(parallel))),
+        )
+        return make_response(
+            {"sync_id": run.id, **summary},
+            f"Sync {run.id} started for {len(todo)} document(s). "
+            f"Follow it with remarkable_transcribe_status('{run.id}').",
+        )
+    except Exception as e:
+        return make_error(
+            error_type="sync_failed",
             message=str(e),
             suggestion="Check remarkable_status() and the server log.",
         )
@@ -2744,7 +2917,8 @@ async def remarkable_transcribe_status(
     """
     <usecase>Check a transcription job and optionally read its text.</usecase>
     <instructions>
-    Without job_id, lists all jobs in this server process. With job_id, returns
+    Without job_id, lists all jobs (and sync runs) in this server process, one
+    line each. A sync id (sync-…) returns that sync's progress. With a job_id, returns
     progress counts (done, blank, failed, pending), mean agreement between the two
     readers, pages below 80 % agreement and the output file paths.
 
@@ -2762,8 +2936,17 @@ async def remarkable_transcribe_status(
     from remarkable_mcp import transcribe
 
     if not job_id:
-        jobs = [transcribe.summarize(j) for j in transcribe.list_jobs()]
-        return make_response({"jobs": jobs}, f"{len(jobs)} job(s).")
+        jobs = [transcribe.brief(j) for j in transcribe.list_jobs()]
+        syncs = [
+            {k: v for k, v in transcribe.summarize_sync(r).items() if k != "jobs"}
+            for r in transcribe.list_syncs()
+        ]
+        data = {"jobs": jobs, **({"syncs": syncs} if syncs else {})}
+        return make_response(data, f"{len(jobs)} job(s). Pass a job_id for details and text.")
+    sync = transcribe.get_sync(job_id)
+    if sync:
+        data = transcribe.summarize_sync(sync)
+        return make_response(data, f"Sync {sync.id}: {data['state']}.")
     job = transcribe.get_job(job_id)
     if not job:
         return make_error(

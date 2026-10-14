@@ -682,6 +682,28 @@ restart needed) or in `REMARKABLE_OCR_VOCABULARY`. The list goes to the
 adjudication pass only, so cached readings stay valid; changing it re-runs the
 adjudication of pages where the readers differed.
 
+**Stable page ids.** The JSON records the document id, its modification time
+and each page's id from the notebook (`page_id`). Page numbers shift when a page
+is inserted; page ids do not, so references to a page can survive edits.
+
+**Cost.** Each job reports the tokens of real API calls (cache hits are free)
+under `usage`, with `estimated_cost_usd` for models with a known list price.
+Set `REMARKABLE_PRICES='{"model": [input, output]}'` (USD per million tokens) to
+add or override prices.
+
+### Keeping transcripts in sync
+
+`remarkable_transcribe_sync()` compares the tablet with the library index
+`_library.json` (in the transcript folder) and transcribes only new documents and
+documents modified since their last full transcription; unchanged pages come
+from the cache. PDFs and e-books are included: their pages are rendered without
+the printed content, and a document without handwriting is recorded in the index
+but leaves no transcript files. Documents removed from the tablet are marked
+`"removed"` in the index and their transcripts are kept, so the transcripts can
+serve as an archive. Use `dry_run=True` to see the plan and `folder="/Journal"` to
+limit the scope. Progress: `remarkable_transcribe_status("sync-…")`. Run it by hand
+or from a scheduled task.
+
 ### Example configuration
 
 [`examples/claude_desktop_config.example.json`](examples/claude_desktop_config.example.json)
