@@ -13,7 +13,7 @@ import os
 import re
 import tempfile
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Literal, Optional
 
@@ -2967,6 +2967,37 @@ async def remarkable_transcribe_sync(
     - remarkable_transcribe_sync(folder="/Journal")
     </examples>
     """
+    response, _ = await _sync_library(dry_run, folder, mode, parallel, workers)
+    return response
+
+
+def _seconds_since(modified: Optional[str]) -> Optional[float]:
+    """Age of an ISO timestamp in seconds, or None if it cannot be read."""
+    if not modified:
+        return None
+    try:
+        stamp = datetime.fromisoformat(str(modified).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - stamp).total_seconds()
+
+
+async def _sync_library(
+    dry_run: bool = False,
+    folder: Optional[str] = None,
+    mode: str = "dual",
+    parallel: int = 2,
+    workers: int = 4,
+    settle_seconds: float = 0,
+    max_documents: Optional[int] = None,
+):
+    """Plan and start a library sync. Returns (response JSON, SyncRun or None).
+
+    ``settle_seconds`` leaves out documents modified more recently than that
+    (still being written); ``max_documents`` refuses to start a bigger sync.
+    """
     from remarkable_mcp import transcribe
 
     try:
@@ -2976,14 +3007,14 @@ async def remarkable_transcribe_sync(
                 error_type="invalid_mode",
                 message=f"Unknown mode '{mode}'.",
                 suggestion="Use 'dual', 'anthropic' or 'gemini'.",
-            )
+            ), None
         missing = [b for b in transcribe.MODES[mode] if not llm_ocr.has_credentials(b)]
         if missing and not dry_run:
             return make_error(
                 error_type="missing_credentials",
                 message=f"No API key configured for: {', '.join(missing)}.",
                 suggestion="Set ANTHROPIC_API_KEY and/or GEMINI_API_KEY in the MCP config.",
-            )
+            ), None
 
         client = await run_blocking(get_rmapi)
         collection = await run_blocking(client.get_meta_items)
@@ -3016,17 +3047,31 @@ async def remarkable_transcribe_sync(
         if scope:
             plan["deleted"] = []  # a partial view cannot tell what left the tablet
         todo = plan["new"] + plan["changed"]
+        settling = []
+        if settle_seconds:
+            settling = [
+                d for d in todo if (_seconds_since(d.get("modified")) or 0) < settle_seconds
+            ]
+            todo = [d for d in todo if d not in settling]
         summary = {
-            "new": [d["path"] for d in plan["new"]],
-            "changed": [d["path"] for d in plan["changed"]],
+            "new": [d["path"] for d in plan["new"] if d not in settling],
+            "changed": [d["path"] for d in plan["changed"] if d not in settling],
             "unchanged": plan["unchanged"],
             "deleted_from_tablet": [d["path"] for d in plan["deleted"]],
         }
+        if settling:
+            summary["still_being_written"] = [d["path"] for d in settling]
         if dry_run or not todo:
             if not dry_run:
                 transcribe.mark_deleted([d["id"] for d in plan["deleted"]])
             hint = f"{len(todo)} document(s) to transcribe, {plan['unchanged']} unchanged."
-            return make_response({"dry_run": dry_run, **summary}, hint)
+            return make_response({"dry_run": dry_run, **summary}, hint), None
+        if max_documents is not None and len(todo) > max_documents:
+            return make_response(
+                {"dry_run": True, **summary},
+                f"{len(todo)} documents to transcribe is more than {max_documents}; "
+                "start this one by hand with remarkable_transcribe_sync().",
+            ), None
 
         async def launch(doc):
             return await _start_transcription(
@@ -3050,13 +3095,58 @@ async def remarkable_transcribe_sync(
             {"sync_id": run.id, **summary},
             f"Sync {run.id} started for {len(todo)} document(s). "
             f"Follow it with remarkable_transcribe_status('{run.id}').",
-        )
+        ), run
     except Exception as e:
         return make_error(
             error_type="sync_failed",
             message=str(e),
             suggestion="Check remarkable_status() and the server log.",
-        )
+        ), None
+
+
+def _env_number(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+async def _auto_sync_loop() -> None:
+    """Transcribe new and changed documents soon after they reach the cloud.
+
+    Every REMARKABLE_AUTO_SYNC_MINUTES the library is compared with the index;
+    a document is taken once it has been left alone for
+    REMARKABLE_AUTO_SYNC_SETTLE_MINUTES (default 10), so a page is not read
+    while it is still being written. Runs of more than
+    REMARKABLE_AUTO_SYNC_MAX_DOCS documents (default 20, e.g. the first full
+    pass) are left for a manual remarkable_transcribe_sync().
+    """
+    import asyncio
+
+    from remarkable_mcp import transcribe
+
+    interval = _env_number("REMARKABLE_AUTO_SYNC_MINUTES", 0) * 60
+    settle = _env_number("REMARKABLE_AUTO_SYNC_SETTLE_MINUTES", 10) * 60
+    limit = int(_env_number("REMARKABLE_AUTO_SYNC_MAX_DOCS", 20))
+    while True:
+        await asyncio.sleep(interval)
+        if transcribe.running_sync() is not None:
+            continue
+        try:
+            response, run = await _sync_library(settle_seconds=settle, max_documents=limit)
+            if run is not None:
+                logger.info("Auto-sync %s started: %s", run.id, response)
+        except Exception as e:  # never let the loop die
+            logger.warning("Auto-sync failed: %s", e)
+
+
+def start_auto_sync():
+    """Start the automatic sync if REMARKABLE_AUTO_SYNC_MINUTES is set; returns the task."""
+    import asyncio
+
+    if _env_number("REMARKABLE_AUTO_SYNC_MINUTES", 0) <= 0:
+        return None
+    return asyncio.get_running_loop().create_task(_auto_sync_loop())
 
 
 @mcp.tool(annotations=TRANSCRIBE_ANNOTATIONS)

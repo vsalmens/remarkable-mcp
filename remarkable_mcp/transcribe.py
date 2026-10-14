@@ -935,6 +935,14 @@ def start_sync(planned: List[dict], deleted: List[dict], unchanged: int, launch,
     return run
 
 
+def running_sync() -> Optional["SyncRun"]:
+    """A sync that is still running, if any."""
+    for run in _SYNCS.values():
+        if run.state == "running":
+            return run
+    return None
+
+
 def cancel_sync(sync_id: str) -> Optional[SyncRun]:
     """Stop a sync: no new documents start and running ones are cancelled."""
     run = _SYNCS.get(sync_id)

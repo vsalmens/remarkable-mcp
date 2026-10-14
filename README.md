@@ -704,6 +704,15 @@ serve as an archive. Use `dry_run=True` to see the plan and `folder="/Journal"` 
 limit the scope. Progress: `remarkable_transcribe_status("sync-…")`. Run it by hand
 or from a scheduled task.
 
+**Automatic sync.** Set `REMARKABLE_AUTO_SYNC_MINUTES` (e.g. `10`) and the
+server checks the library that often and transcribes what is new or changed,
+so a notebook is transcribed soon after it syncs, not on a schedule. A
+document is taken only once it has been left alone for
+`REMARKABLE_AUTO_SYNC_SETTLE_MINUTES` (default 10), so pages are not read while
+you are still writing. A run of more than `REMARKABLE_AUTO_SYNC_MAX_DOCS`
+documents (default 20, such as the very first pass) is left for a manual
+`remarkable_transcribe_sync()`. Off by default.
+
 `remarkable_transcribe_cancel(job_id)` stops a job or a sync (`"sync-…"`).
 Pages already finished are written out and stay cached.
 

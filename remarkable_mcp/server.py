@@ -329,9 +329,14 @@ async def lifespan(app: MCPServer) -> AsyncIterator[None]:
         logger.info("Cloud/USB/local-directory mode: starting background loader...")
         task = start_background_loader()
 
+    from remarkable_mcp.tools import start_auto_sync
+
+    auto_sync = start_auto_sync()
     try:
         yield
     finally:
+        if auto_sync is not None:
+            auto_sync.cancel()
         # Stop background loader on shutdown (if running)
         await stop_background_loader(task)
         from remarkable_mcp.api import close_device_client

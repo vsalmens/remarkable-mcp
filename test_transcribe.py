@@ -864,3 +864,46 @@ def test_pen_marks_are_told_apart_from_handwriting_over_the_print():
     ]
     left = residual.getbbox()
     assert left is not None and left[1] >= 95 and left[3] <= 135  # only the note is left
+
+
+@pytest.mark.asyncio
+@patch("remarkable_mcp.tools.get_rmapi")
+async def test_auto_sync_waits_until_writing_has_stopped(mock_get_rmapi, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    from remarkable_mcp import notebooks, tools
+    from test_server import _make_notebook_zip
+
+    def stamp(minutes_ago):
+        return (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
+
+    fresh = Mock(
+        ID="fresh", VissibleName="Now", Parent="", is_folder=False, is_cloud_archived=False
+    )
+    fresh.ModifiedClient = stamp(2)
+    settled = Mock(
+        ID="settled", VissibleName="Earlier", Parent="", is_folder=False, is_cloud_archived=False
+    )
+    settled.ModifiedClient = stamp(30)
+    client = Mock(get_meta_items=Mock(return_value=[fresh, settled]))
+    client.download.return_value = _make_notebook_zip(notebooks.page_rm_bytes("Hello ink"))
+    mock_get_rmapi.return_value = client
+
+    with (
+        patch("remarkable_mcp.llm_ocr.ocr_png", side_effect=lambda png, b, *a: f"{b} text"),
+        patch("remarkable_mcp.llm_ocr.adjudicate_png", return_value="final text"),
+    ):
+        refused, run = await tools._sync_library(settle_seconds=600, max_documents=0)
+        assert run is None and "by hand" in json.loads(refused)["_hint"]
+        response, run = await tools._sync_library(settle_seconds=600, max_documents=5)
+        await run.task
+    data = json.loads(response)
+    assert data["new"] == ["/Earlier"] and data["still_being_written"] == ["/Now"]
+    assert set(transcribe.load_index()["documents"]) == {"settled"}
+
+
+def test_auto_sync_is_off_unless_configured(monkeypatch):
+    from remarkable_mcp import tools
+
+    monkeypatch.delenv("REMARKABLE_AUTO_SYNC_MINUTES", raising=False)
+    assert tools.start_auto_sync() is None
