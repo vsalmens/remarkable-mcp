@@ -2508,20 +2508,15 @@ def _ocr_tesseract(rm_files: List[Path]) -> Optional[List[str]]:
 # Pen marks on PDF pages: printed text under the ink, handwriting apart from it
 # ---------------------------------------------------------------------------
 
-# A word counts as marked when ink crosses at least this share of its width
-# inside the band where a strike-through or an underline of that word lies:
-# from MARK_BAND_TOP below the top of the word box to MARK_BAND_BELOW below
-# its bottom (fractions of the word height). The band stays clear of the
-# lines above and below, so a mark on one line does not mark its neighbours.
+# A word counts as marked when a pen line or highlight crosses at least this
+# share of its width inside the band where a strike-through or an underline of
+# that word lies: from MARK_BAND_TOP below the top of the word box to
+# MARK_BAND_BELOW below its bottom (fractions of the word height). The band
+# stays clear of the lines above and below, so a mark on one line does not mark
+# its neighbours. A word inside a drawn loop (circled) is marked too.
 MARK_COVERAGE = 0.6
 MARK_BAND_TOP = 0.2
 MARK_BAND_BELOW = 0.25
-# Ink near a word, out to ERASE_BAND_BELOW of its height below it, belongs to
-# the mark when erasing marks from the handwriting image.
-ERASE_BAND_BELOW = 0.6
-# Ink over a smaller share of a word (a mark running past the last word) is
-# still treated as part of the mark rather than as handwriting.
-TOUCH_COVERAGE = 0.15
 _INK_ALPHA = 40
 _RESIDUAL_MIN_PIXELS = 120
 
@@ -2544,32 +2539,30 @@ def _column_coverage(mask, box) -> float:
     return inked / (x1 - x0)
 
 
-def find_marked_words(mask, words: list, scale: float) -> Tuple[list, list]:
+def find_marked_words(mask, words: list, scale: float, loops: Optional[list] = None) -> list:
     """Group printed words that carry pen marks into phrases.
 
-    ``mask`` is an 'L' image (255 = ink) aligned with the PDF page at ``scale``
-    pixels per point; ``words`` are PyMuPDF word tuples (x0, y0, x1, y1, text,
-    ...) in reading order. Returns ``(phrases, boxes)``: the marked phrases and
-    the pixel boxes of every word the pen touched, so that ink can be told
-    apart from handwriting.
+    ``mask`` is an 'L' image (255 = ink) of the pen lines and highlights,
+    aligned with the PDF page at ``scale`` pixels per point; ``words`` are
+    PyMuPDF word tuples (x0, y0, x1, y1, text, ...) in reading order; ``loops``
+    are pixel boxes of drawn loops (circled text). Returns the marked phrases.
     """
+    loops = loops or []
     phrases: list = []
-    boxes: list = []
     current: list = []
     last_index = None
     for index, word in enumerate(words):
         x0, y0, x1, y1, text = word[:5]
         height = (y1 - y0) * scale
-        erase_box = (x0 * scale, y0 * scale, x1 * scale, y1 * scale + ERASE_BAND_BELOW * height)
-        if _column_coverage(mask, erase_box) >= TOUCH_COVERAGE:
-            boxes.append(erase_box)
         band = (
             x0 * scale,
             y0 * scale + MARK_BAND_TOP * height,
             x1 * scale,
             y1 * scale + MARK_BAND_BELOW * height,
         )
-        if _column_coverage(mask, band) >= MARK_COVERAGE:
+        cx, cy = (x0 + x1) / 2 * scale, (y0 + y1) / 2 * scale
+        circled = any(lx0 <= cx <= lx1 and ly0 <= cy <= ly1 for lx0, ly0, lx1, ly1 in loops)
+        if circled or _column_coverage(mask, band) >= MARK_COVERAGE:
             if current and last_index is not None and index != last_index + 1:
                 phrases.append(" ".join(current))
                 current = []
@@ -2577,7 +2570,94 @@ def find_marked_words(mask, words: list, scale: float) -> Tuple[list, list]:
             last_index = index
     if current:
         phrases.append(" ".join(current))
-    return [_tidy_phrase(p) for p in phrases], boxes
+    return [_tidy_phrase(p) for p in phrases]
+
+
+def _ink_components(mask) -> list:
+    """Connected pieces of ink (8-connected) in a 0/255 'L' mask.
+
+    Each piece is a dict with its pixel indices, its bounding box and the top
+    and bottom row of ink in each of its columns.
+    """
+    width, height = mask.size
+    data = mask.tobytes()
+    seen = bytearray(len(data))
+    pieces = []
+    pos = data.find(b"\xff")
+    while pos != -1:
+        if not seen[pos]:
+            seen[pos] = 1
+            stack = [pos]
+            pixels = []
+            columns: Dict[int, list] = {}
+            while stack:
+                i = stack.pop()
+                pixels.append(i)
+                y, x = divmod(i, width)
+                span = columns.get(x)
+                if span is None:
+                    columns[x] = [y, y]
+                elif y < span[0]:
+                    span[0] = y
+                elif y > span[1]:
+                    span[1] = y
+                for ny in (y - 1, y, y + 1):
+                    if ny < 0 or ny >= height:
+                        continue
+                    row = ny * width
+                    for nx in (x - 1, x, x + 1):
+                        if 0 <= nx < width:
+                            j = row + nx
+                            if data[j] and not seen[j]:
+                                seen[j] = 1
+                                stack.append(j)
+            spans = columns.values()
+            pieces.append(
+                {
+                    "pixels": pixels,
+                    "columns": columns,
+                    "box": (
+                        min(columns),
+                        min(s[0] for s in spans),
+                        max(columns),
+                        max(s[1] for s in spans),
+                    ),
+                }
+            )
+        pos = data.find(b"\xff", pos + 1)
+    return pieces
+
+
+def _classify_ink(piece: dict, word_height: float, scale: float, width: int) -> Optional[str]:
+    """Tell a pen mark on the printed text from handwriting.
+
+    Returns "line" (an underline or strike-through: long, roughly level and
+    thin in every column), "highlight" (a long solid band), "loop" (a ring drawn around
+    text) or None for handwriting. ``width`` is the mask width in pixels.
+    """
+    x0, y0, x1, y1 = piece["box"]
+    w, h = x1 - x0 + 1, y1 - y0 + 1
+    count = len(piece["pixels"])
+    if w < 1.5 * word_height:
+        return None
+    spans = [bottom - top + 1 for top, bottom in piece["columns"].values()]
+    thin = max(3 * scale, 0.35 * word_height)
+    if h <= 1.2 * word_height and sum(1 for s in spans if s <= thin) >= 0.85 * len(spans):
+        return "line"
+    fill = count / (w * h)
+    if h <= 1.6 * word_height and fill >= 0.6:
+        return "highlight"
+    tall = sum(1 for s in spans if s >= 0.5 * h)
+    if h >= 0.8 * word_height and fill < 0.25 and tall >= 0.6 * len(spans):
+        band_x, band_y = max(2.0, 0.2 * w), max(2.0, 0.2 * h)
+        near_edge = 0
+        for i in piece["pixels"]:
+            y, x = divmod(i, width)
+            if x < x0 + band_x or x > x1 - band_x or y < y0 + band_y or y > y1 - band_y:
+                near_edge += 1
+        if near_edge >= 0.85 * count:
+            return "loop"
+    return None
 
 
 def _tidy_phrase(phrase: str) -> str:
@@ -2586,6 +2666,46 @@ def _tidy_phrase(phrase: str) -> str:
 
     phrase = unicodedata.normalize("NFKC", phrase)
     return re.sub(r"(\w)- (\w)", r"\1\2", phrase)
+
+
+def split_pen_marks(mask, words: list, scale: float) -> Tuple[list, Any]:
+    """Split the ink on a PDF page into marks on the printed text and handwriting.
+
+    ``mask`` is the page's ink as an 'L' image (255 = ink) at ``scale`` pixels
+    per point; ``words`` are the PDF's word tuples. Each connected piece of ink
+    is classified as a whole: lines, highlights and rings around printed words
+    mark text, everything else is handwriting, even where it is written over
+    the print. Returns the marked phrases and a mask of the handwriting.
+    """
+    from PIL import Image
+
+    residual = bytearray(mask.tobytes())
+    if not words:
+        return [], mask
+    heights = sorted((w[3] - w[1]) * scale for w in words)
+    word_height = heights[len(heights) // 2]
+    marks = bytearray(len(residual))
+    loops = []
+    for piece in _ink_components(mask):
+        kind = _classify_ink(piece, word_height, scale, mask.size[0])
+        if kind is None:
+            continue  # handwriting stays in the residual image
+        if kind == "loop":
+            lx0, ly0, lx1, ly1 = piece["box"]
+            if not any(
+                lx0 <= (w[0] + w[2]) / 2 * scale <= lx1 and ly0 <= (w[1] + w[3]) / 2 * scale <= ly1
+                for w in words
+            ):
+                continue  # a ring around no printed word: handwriting
+            loops.append(piece["box"])
+        else:
+            for i in piece["pixels"]:
+                marks[i] = 255
+        for i in piece["pixels"]:
+            residual[i] = 0
+    mark_mask = Image.frombytes("L", mask.size, bytes(marks))
+    phrases = find_marked_words(mark_mask, words, scale, loops)
+    return phrases, Image.frombytes("L", mask.size, bytes(residual))
 
 
 def analyze_pdf_page_annotations(
@@ -2628,7 +2748,7 @@ def _analyze_extracted(tmpdir_path: Path, page: int, scale: float) -> Optional[D
     import io
 
     import fitz
-    from PIL import Image, ImageDraw
+    from PIL import Image
 
     pdf_files = list(tmpdir_path.glob("**/*.pdf"))
     if not pdf_files:
@@ -2675,16 +2795,10 @@ def _analyze_extracted(tmpdir_path: Path, page: int, scale: float) -> Optional[D
 
     ink = Image.open(io.BytesIO(ink_png)).convert("RGBA").getchannel("A")
     mask = ink.point(lambda v: 255 if v > _INK_ALPHA else 0)
-    if words:
-        result["marked"], boxes = find_marked_words(mask, words, scale)
-        if boxes:
-            draw = ImageDraw.Draw(mask)
-            pad = 2 * scale
-            for x0, y0, x1, y1 in boxes:
-                draw.rectangle((x0 - pad, y0 - pad, x1 + pad, y1 + pad), fill=0)
-    if mask.histogram()[255] >= _RESIDUAL_MIN_PIXELS * scale:
-        residual = mask.point(lambda v: 0 if v else 255)  # black ink on white
+    marked, residual = split_pen_marks(mask, words, scale)
+    result["marked"] = marked
+    if residual.histogram()[255] >= _RESIDUAL_MIN_PIXELS * scale:
         buf = io.BytesIO()
-        residual.save(buf, format="PNG")
+        residual.point(lambda v: 0 if v else 255).save(buf, format="PNG")  # black ink on white
         result["residual_png"] = buf.getvalue()
     return result

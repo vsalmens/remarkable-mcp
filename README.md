@@ -714,9 +714,13 @@ highlighted with the pen are read from the PDF's own text instead of by OCR,
 so they cost nothing and come out exact. They appear as **Marked in the text**
 for each page, one phrase per run of marked words. Only the ink that is left
 over after the marked words are taken away (margin notes, arrows, handwriting)
-goes to the OCR models; a page with marks only makes no API calls. Ink is
-matched to a word when it covers most of the word's width on the word or just
-below it. Scanned PDFs without a text layer fall back to OCR of all ink.
+goes to the OCR models; a page with marks only makes no API calls. Each
+connected piece of ink is judged as a whole: long, level, thin lines
+(underlines, strike-throughs), solid bands (highlights) and rings drawn around
+printed words are marks; anything else is handwriting and is kept for OCR, even
+a note written between or over the printed lines. A line marks a word when it
+covers most of the word's width on the word or just below it. Scanned PDFs
+without a text layer fall back to OCR of all ink.
 
 ### Example configuration
 

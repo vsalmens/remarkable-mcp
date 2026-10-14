@@ -658,9 +658,7 @@ def test_find_marked_words_groups_phrases():
         (150, 10, 220, 30, "third"),
         (5, 60, 60, 80, "next"),
     ]
-    phrases, boxes = find_marked_words(mask, words, 1.0)
-    assert phrases == ["first second"]
-    assert len(boxes) == 2  # "third" is barely touched (under the 15 % limit)
+    assert find_marked_words(mask, words, 1.0) == ["first second"]
 
 
 def test_strike_through_marks_only_its_own_line():
@@ -681,8 +679,7 @@ def test_strike_through_marks_only_its_own_line():
         (65, 22, 120, 32, "too"),
         (5, 44, 60, 54, "below"),
     ]
-    phrases, _ = find_marked_words(mask, words, 1.0)
-    assert phrases == ["struck words underlined too"]
+    assert find_marked_words(mask, words, 1.0) == ["struck words underlined too"]
 
 
 def test_marked_phrases_rejoin_hyphenated_words_and_ligatures():
@@ -695,7 +692,7 @@ def test_marked_phrases_rejoin_hyphenated_words_and_ligatures():
     draw.line((5, 32, 60, 32), fill=255, width=2)
     draw.line((5, 82, 60, 82), fill=255, width=2)
     words = [(5, 10, 60, 30, "promi-"), (5, 60, 60, 80, "nent ﬁndings")]
-    assert find_marked_words(mask, words, 1.0)[0] == ["prominent findings"]
+    assert find_marked_words(mask, words, 1.0) == ["prominent findings"]
 
 
 def test_pdf_marks_come_from_the_text_layer(tmp_path):
@@ -825,3 +822,30 @@ def test_outputs_replace_files_that_cannot_be_opened_for_writing(tmp_path):
     transcribe._write_atomic(target, "new")
     assert target.read_text() == "new"
     assert [p.name for p in tmp_path.iterdir()] == ["old.md"]
+
+
+def test_pen_marks_are_told_apart_from_handwriting_over_the_print():
+    from PIL import Image, ImageDraw, ImageFont
+
+    from remarkable_mcp.extract import split_pen_marks
+
+    # scale 1: three lines of 20 px high words
+    words = [
+        (10, 10, 90, 30, "struck", 0, 0, 0),
+        (100, 10, 190, 30, "phrase", 0, 0, 1),
+        (10, 60, 90, 80, "plain", 0, 1, 0),
+        (100, 60, 190, 80, "circled", 0, 1, 1),
+        (10, 110, 90, 130, "noted", 0, 2, 0),
+        (100, 110, 190, 130, "glowing", 0, 2, 1),
+    ]
+    mask = Image.new("L", (400, 160), 0)
+    draw = ImageDraw.Draw(mask)
+    draw.line((10, 20, 190, 22), fill=255, width=3)  # strike-through, slightly sloped
+    draw.ellipse((92, 52, 198, 88), outline=255, width=2)  # ring around "circled"
+    draw.rectangle((100, 112, 190, 128), fill=255)  # highlighter band over "glowing"
+    font = ImageFont.load_default(size=28)
+    draw.text((20, 98), "Orch OR", fill=255, font=font)  # note written over "noted"
+    phrases, residual = split_pen_marks(mask, words, 1.0)
+    assert phrases == ["struck phrase", "circled", "glowing"]
+    left = residual.getbbox()
+    assert left is not None and left[1] >= 95 and left[3] <= 135  # only the note is left
