@@ -519,13 +519,13 @@ def test_index_records_only_main_full_runs():
     assert docs["e"]["no_handwriting"] is True and docs["e"]["output_markdown"] is None
 
 
-def test_plan_sync_and_mark_removed():
+def test_plan_sync_and_mark_deleted():
     index = {
         "documents": {
             "same": {"modified": "1", "status": "on_device", "path": "/S"},
             "edited": {"modified": "1", "status": "on_device", "path": "/E"},
             "gone": {"modified": "1", "status": "on_device", "path": "/G"},
-            "back": {"modified": "1", "status": "removed", "path": "/B"},
+            "back": {"modified": "1", "status": "deleted", "path": "/B"},
         }
     }
     docs = [
@@ -537,10 +537,10 @@ def test_plan_sync_and_mark_removed():
     plan = transcribe.plan_sync(docs, index)
     assert [d["id"] for d in plan["new"]] == ["fresh"]
     assert [d["id"] for d in plan["changed"]] == ["edited", "back"]
-    assert plan["unchanged"] == 1 and plan["removed"] == [{"id": "gone", "path": "/G"}]
+    assert plan["unchanged"] == 1 and plan["deleted"] == [{"id": "gone", "path": "/G"}]
     transcribe.save_index(index)
-    transcribe.mark_removed(["gone"])
-    assert transcribe.load_index()["documents"]["gone"]["status"] == "removed"
+    transcribe.mark_deleted(["gone"])
+    assert transcribe.load_index()["documents"]["gone"]["status"] == "deleted"
 
 
 @pytest.mark.asyncio
@@ -599,7 +599,7 @@ async def test_sync_tool_transcribes_only_changes(mock_get_rmapi, monkeypatch):
 
         client.get_meta_items.return_value = [folder, secret]
         gone = await call({})
-        assert gone["removed_from_tablet"] == ["/Notes"]
+        assert gone["deleted_from_tablet"] == ["/Notes"]
     entry = transcribe.load_index()["documents"]["doc-1"]
-    assert entry["status"] == "removed" and entry["output_markdown"]
+    assert entry["status"] == "deleted" and entry["output_markdown"]
     assert "s" not in transcribe.load_index()["documents"]

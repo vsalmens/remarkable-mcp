@@ -2795,7 +2795,7 @@ async def remarkable_transcribe_sync(
     new or edited pages. Documents without handwriting (e.g. unannotated PDFs)
     are recorded but leave no transcript files.
 
-    Documents that are no longer on the tablet are marked "removed" in the
+    Documents that are no longer on the tablet are marked "deleted" in the
     index; their transcripts are kept. Nothing on the tablet is changed.
 
     Returns a sync id at once; follow it with remarkable_transcribe_status(sync_id).
@@ -2861,17 +2861,17 @@ async def remarkable_transcribe_sync(
         index = transcribe.load_index()
         plan = transcribe.plan_sync(documents, index)
         if scope:
-            plan["removed"] = []  # a partial view cannot tell what left the tablet
+            plan["deleted"] = []  # a partial view cannot tell what left the tablet
         todo = plan["new"] + plan["changed"]
         summary = {
             "new": [d["path"] for d in plan["new"]],
             "changed": [d["path"] for d in plan["changed"]],
             "unchanged": plan["unchanged"],
-            "removed_from_tablet": [d["path"] for d in plan["removed"]],
+            "deleted_from_tablet": [d["path"] for d in plan["deleted"]],
         }
         if dry_run or not todo:
             if not dry_run:
-                transcribe.mark_removed([d["id"] for d in plan["removed"]])
+                transcribe.mark_deleted([d["id"] for d in plan["deleted"]])
             hint = f"{len(todo)} document(s) to transcribe, {plan['unchanged']} unchanged."
             return make_response({"dry_run": dry_run, **summary}, hint)
 
@@ -2888,7 +2888,7 @@ async def remarkable_transcribe_sync(
 
         run = transcribe.start_sync(
             todo,
-            plan["removed"],
+            plan["deleted"],
             plan["unchanged"],
             launch,
             parallel=max(1, min(8, int(parallel))),

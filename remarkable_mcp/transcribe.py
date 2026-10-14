@@ -15,8 +15,8 @@ REMARKABLE_TRANSCRIPT_LANG ("en" default, "fi").
 A library index (_library.json in the same folder) records, per document id,
 the modification time that was last transcribed in full and whether the
 document is still on the tablet. remarkable_transcribe_sync uses it to
-transcribe only new and changed documents; transcripts of documents removed
-from the tablet stay where they are and are marked "removed".
+transcribe only new and changed documents; transcripts of documents deleted
+from the tablet stay where they are and are marked "deleted".
 """
 
 from __future__ import annotations
@@ -710,15 +710,15 @@ def plan_sync(documents: List[dict], index: dict) -> dict:
         else:
             unchanged += 1
     present = {doc["id"] for doc in documents}
-    removed = [
+    deleted = [
         {"id": doc_id, "path": entry.get("path")}
         for doc_id, entry in known.items()
         if doc_id not in present and entry.get("status") == "on_device"
     ]
-    return {"new": new, "changed": changed, "unchanged": unchanged, "removed": removed}
+    return {"new": new, "changed": changed, "unchanged": unchanged, "deleted": deleted}
 
 
-def mark_removed(doc_ids: List[str]) -> None:
+def mark_deleted(doc_ids: List[str]) -> None:
     if not doc_ids:
         return
     index = load_index()
@@ -726,8 +726,8 @@ def mark_removed(doc_ids: List[str]) -> None:
     for doc_id in doc_ids:
         entry = index["documents"].get(doc_id)
         if entry is not None:
-            entry["status"] = "removed"
-            entry["removed"] = stamp
+            entry["status"] = "deleted"
+            entry["deleted"] = stamp
     save_index(index)
 
 
@@ -735,7 +735,7 @@ def mark_removed(doc_ids: List[str]) -> None:
 class SyncRun:
     id: str
     planned: List[dict]
-    removed: List[dict]
+    deleted: List[dict]
     unchanged: int
     started: float = field(default_factory=time.time)
     finished: Optional[float] = None
@@ -748,17 +748,17 @@ class SyncRun:
 _SYNCS: Dict[str, SyncRun] = {}
 
 
-def start_sync(planned: List[dict], removed: List[dict], unchanged: int, launch, parallel: int):
+def start_sync(planned: List[dict], deleted: List[dict], unchanged: int, launch, parallel: int):
     """Transcribe ``planned`` documents in the background, ``parallel`` at a time.
 
     ``launch(doc)`` is an async callable that starts a job for one document and
     returns it (or raises).
     """
     run = SyncRun(
-        id="sync-" + uuid.uuid4().hex[:6], planned=planned, removed=removed, unchanged=unchanged
+        id="sync-" + uuid.uuid4().hex[:6], planned=planned, deleted=deleted, unchanged=unchanged
     )
     _SYNCS[run.id] = run
-    mark_removed([d["id"] for d in removed])
+    mark_deleted([d["id"] for d in deleted])
 
     async def one(doc, sem):
         async with sem:
@@ -802,7 +802,7 @@ def summarize_sync(run: SyncRun) -> dict:
         "documents_planned": len(run.planned),
         "documents_finished": sum(1 for j in jobs if j.finished is not None),
         "unchanged": run.unchanged,
-        "removed_from_tablet": [d["path"] for d in run.removed],
+        "deleted_from_tablet": [d["path"] for d in run.deleted],
         "pages_transcribed": sum(1 for j in jobs for r in j.results.values() if r.status == "done"),
         "elapsed_seconds": round((run.finished or time.time()) - run.started),
         "jobs": [brief(j) for j in jobs],

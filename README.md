@@ -698,8 +698,8 @@ add or override prices.
 documents modified since their last full transcription; unchanged pages come
 from the cache. PDFs and e-books are included: their pages are rendered without
 the printed content, and a document without handwriting is recorded in the index
-but leaves no transcript files. Documents removed from the tablet are marked
-`"removed"` in the index and their transcripts are kept, so the transcripts can
+but leaves no transcript files. Documents deleted from the tablet are marked
+`"deleted"` in the index and their transcripts are kept, so the transcripts can
 serve as an archive. Use `dry_run=True` to see the plan and `folder="/Journal"` to
 limit the scope. Progress: `remarkable_transcribe_status("sync-…")`. Run it by hand
 or from a scheduled task.
