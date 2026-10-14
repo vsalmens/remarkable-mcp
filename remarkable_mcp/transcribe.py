@@ -795,7 +795,7 @@ async def _compose_page(job: Job, page: int, sem) -> None:
                 180.0,
                 job.models.get("composer"),
             )
-            r.annotations = extract.checked_annotations(data, inputs["blocks"])
+            r.annotations = extract.checked_annotations(data, inputs["blocks"], r.final or "")
         except Exception as e:  # the geometric marks and the handwriting remain
             logger.warning("Composing annotations of page %s failed: %s", page, e)
 

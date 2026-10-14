@@ -3279,7 +3279,15 @@ def _merge_tables(tables: list, page: str) -> dict:
     return first
 
 
-def checked_annotations(data: Optional[dict], blocks: list) -> Optional[dict]:
+def _words(text: str) -> set:
+    import unicodedata
+
+    return set(re.findall(r"\w\w+", unicodedata.normalize("NFKC", text or "").lower()))
+
+
+def checked_annotations(
+    data: Optional[dict], blocks: list, handwriting: Optional[str] = None
+) -> Optional[dict]:
     """Keep only annotation items whose printed text is really on the page.
 
     A quote or table cell that cannot be found in the page's text (after
@@ -3287,11 +3295,18 @@ def checked_annotations(data: Optional[dict], blocks: list) -> Optional[dict]:
     composed annotations never put words in the author's mouth. The rest is
     tidied the same way whichever model composed it: items in reading order,
     pieces of one table joined, drawing descriptions left out of notes and
-    only real symbols kept.
+    only real symbols kept. Given the page's ``handwriting`` transcript, a
+    note with words that are not in it is dropped: the composer places the
+    readers' text, it never reads the handwriting a third time.
     """
     if not isinstance(data, dict):
         return None
     page = _letters(" ".join(blocks))
+    written = _words(handwriting) if handwriting is not None else None
+
+    def from_readers(note: str) -> str:
+        return note if written is None or _words(note) <= written else ""
+
     placed = []  # (position on the page, item)
     tables: Dict[str, list] = {}
     for item in data.get("items") or []:
@@ -3301,7 +3316,7 @@ def checked_annotations(data: Optional[dict], blocks: list) -> Optional[dict]:
         if "symbols" in item:
             item["symbols"] = _clean_symbols(item.get("symbols"))
         if "note" in item:
-            item["note"] = _clean_note(item.get("note"))
+            item["note"] = from_readers(_clean_note(item.get("note")))
         if item.get("type") == "table":
             cells = [
                 c
@@ -3327,7 +3342,7 @@ def checked_annotations(data: Optional[dict], blocks: list) -> Optional[dict]:
         keys = [_row_key(r) for r in table["rows"] if isinstance(r, list)]
         placed.append((min((page.find(k) for k in keys if k), default=10**9), table))
     items = [item for _, item in sorted(placed, key=lambda pair: pair[0])]
-    notes = [_clean_note(n) for n in data.get("unplaced_notes") or []]
+    notes = [from_readers(_clean_note(n)) for n in data.get("unplaced_notes") or []]
     notes = [n for n in notes if n]
     if not items and not notes:
         return None

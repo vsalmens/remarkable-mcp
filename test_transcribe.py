@@ -1228,3 +1228,17 @@ def test_composer_pens_written_as_text_are_compared_as_pens():
     assert pens.line("ballpoint, black, 0.84 mm")
     assert pens.line("ballpoint, black, 0.54 mm") is None  # pressure, not a new pen
     assert pens.line("ballpoint, red, 0.54 mm")
+
+
+def test_composer_notes_must_come_from_the_readers():
+    from remarkable_mcp.extract import checked_annotations
+
+    data = {
+        "items": [
+            {"type": "passage", "quote": "Global states concern **profile.**", "note": "Orch OR\nHameroff"},
+            {"type": "passage", "quote": "Local states are **contents.**", "note": "invented words"},
+        ]
+    }
+    blocks = ["Global states concern profile. Local states are contents."]
+    out = checked_annotations(data, blocks, "[oval]\norch OR\nHameroff")
+    assert [i.get("note") for i in out["items"]] == ["Orch OR Hameroff", ""]
