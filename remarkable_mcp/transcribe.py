@@ -364,9 +364,10 @@ def write_outputs(job: Job) -> None:
                 ]
             lines += ["</details>", ""]
     md = base.with_name(base.name + ".md")
-    md.write_text("\n".join(lines), encoding="utf-8")
+    _write_atomic(md, "\n".join(lines))
     js = base.with_name(base.name + ".json")
-    js.write_text(
+    _write_atomic(
+        js,
         json.dumps(
             {
                 "document": job.document,
@@ -400,7 +401,6 @@ def write_outputs(job: Job) -> None:
             ensure_ascii=False,
             indent=2,
         ),
-        encoding="utf-8",
     )
     job.output_md, job.output_json = str(md), str(js)
 
@@ -731,14 +731,28 @@ def load_index() -> dict:
     return {"documents": {}}
 
 
+def _write_atomic(path: Path, text: str) -> None:
+    """Write via a temporary file and rename it into place.
+
+    Readers never see a half-written file, and replacing a file needs only
+    write access to its folder: macOS can refuse to open for writing a file
+    that another app created or moved there (EPERM), yet allow the rename.
+    """
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-", suffix=path.suffix)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
 def save_index(index: dict) -> None:
     path = index_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     index["updated"] = datetime.now().isoformat(timespec="seconds")
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".library-", suffix=".json")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(index, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    _write_atomic(path, json.dumps(index, ensure_ascii=False, indent=2))
 
 
 def _is_main_run(job: Job) -> bool:

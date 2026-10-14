@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 from unittest.mock import Mock, patch
 
 import pymupdf
@@ -814,3 +815,13 @@ def test_cancel_job_keeps_finished_pages():
     assert job.state == "cancelled"
     assert job.results[1].final == "first page" and job.results[2].status != "done"
     assert open(transcribe.summarize(job)["output_markdown"], encoding="utf-8").read()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+def test_outputs_replace_files_that_cannot_be_opened_for_writing(tmp_path):
+    target = tmp_path / "old.md"
+    target.write_text("old")
+    target.chmod(0o444)  # stands in for a file macOS will not open for writing
+    transcribe._write_atomic(target, "new")
+    assert target.read_text() == "new"
+    assert [p.name for p in tmp_path.iterdir()] == ["old.md"]
