@@ -410,3 +410,23 @@ def test_shared_notation_runs_and_suggestions():
     data = json.load(open(transcribe.summarize(job)["output_json"], encoding="utf-8"))
     assert data["pages"]["1"]["suggestions"] == [["anne", "Anna"]]
     assert "word→suggestion (?)" in data["notation"]
+
+
+def test_document_without_handwriting_writes_no_files(tmp_path):
+    job, adj = _run(
+        dict(
+            document="Paper.pdf",
+            path="/R/Paper.pdf",
+            mode="dual",
+            pages=[1, 2],
+            total_pages=2,
+            workers=1,
+        ),
+        {1: BLANK, 2: None},
+        lambda png, b: "should not be called",
+    )
+    s = transcribe.summarize(job)
+    assert s["state"] == "done" and s["no_handwriting"] is True
+    assert "output_markdown" not in s and adj.call_count == 0
+    out = tmp_path / "out"
+    assert not out.exists() or not any(out.iterdir())

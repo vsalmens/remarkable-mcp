@@ -470,7 +470,8 @@ async def run_job(job: Job, raw_doc: bytes, render, workers: int) -> None:
         await asyncio.gather(*(_read_page(job, tmp, p, render, sem) for p in job.pages))
         pending = [p for p in job.pages if job.results[p].status == "pending"]
         await asyncio.gather(*(_adjudicate_page(job, tmp, p, render, sem) for p in pending))
-        write_outputs(job)
+        if any(r.status != "blank" for r in job.results.values()):
+            write_outputs(job)  # a document without handwriting leaves no files behind
         job.state = "done"
     except Exception as e:
         logger.warning("Transcription job %s failed: %s", job.id, e)
@@ -565,6 +566,12 @@ def summarize(job: Job) -> dict:
         )
         if flagged:
             out["pages_with_uncertainty_markers"] = flagged
+    if (
+        job.state == "done"
+        and job.results
+        and all(r.status == "blank" for r in job.results.values())
+    ):
+        out["no_handwriting"] = True
     if job.output_md:
         out["output_markdown"] = job.output_md
         out["output_json"] = job.output_json
