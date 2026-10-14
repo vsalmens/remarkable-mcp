@@ -566,3 +566,123 @@ def adjudicate_png(
     if path:
         _cache_put(path, text)
     return text
+
+
+# ---------------------------------------------------------------------------
+# Annotations on PDF pages: tie marks, notes and symbols to the printed text
+# ---------------------------------------------------------------------------
+
+COMPOSE_VERSION = "c1"
+
+COMPOSE_PROMPT = """You see a printed page (from a PDF) that a reader annotated with a pen: \
+dark ink over the print. You also get (A) the page's printed text from the PDF text layer, \
+in blocks; (B) passages a geometric pass found marked, marked words in **bold** (a hint, \
+it can miss or over-reach); (C) the transcription of the reader's handwriting on this page.
+
+Write down the reader's annotations as JSON, nothing else:
+{{"items": [...], "unplaced_notes": ["..."]}}
+
+Each item is either a passage or a table.
+
+Passage: {{"type": "passage", "quote": "...", "note": "...", "symbols": ["?"], "label": "I"}}
+- quote: the whole sentence or sentences around the mark, copied exactly from (A), with the \
+words the pen marked (underlined, struck through, highlighted, circled) wrapped in **...**. \
+Keep sentences whole. Put neighbouring marked sentences that belong together in one quote. \
+When a vertical line, bracket or brace in the margin marks a paragraph, quote the whole \
+paragraph and wrap all of it in **...**.
+- note: the handwriting that belongs to this passage, copied exactly from (C) with its \
+notation: words written beside or between its lines, joined to it by a line or arrow, or \
+written near the reference it comments on. Leave it out when there is none.
+- symbols: marks the reader drew that are not words, such as "?", "!", "!!", "*", a tick; \
+attached to the passage or term they stand next to. Leave it out when there are none.
+- label: a label the reader wrote at the passage, such as I, II, 1 or *1, especially when the \
+same label appears in a note; without brackets. Leave it out when there is none.
+
+Table: {{"type": "table", "caption": "...", "headers": ["..."], "rows": [["cell", "..."], "…"], \
+"symbols": [], "note": "..."}}
+- for marks inside a table: its caption (e.g. "Table 1. Summary of ..."), its column headers, \
+and only the rows the reader marked, in order, as lists of cells copied from (A); put the \
+string "…" where rows were left out (also at the start or end). Wrap the marked cells or \
+words in **...**; a ring drawn around or next to words marks the nearest group of words. \
+A symbol drawn next to a row goes at the end of that row's first cell after "✎", e.g. \
+"Questions ✎?".
+
+Rules: quote only text that is in (A); never paraphrase, translate or correct it. Take \
+notes only from (C); use the image to decide where each note belongs, not to re-read it. \
+Every note in (C) appears exactly once, in an item or in unplaced_notes. Return JSON only.
+
+(A) Printed text:
+{blocks}
+
+(B) Marked passages found geometrically:
+{marks}
+
+(C) Handwriting on the page:
+{handwriting}
+"""
+
+
+def build_compose_prompt(blocks: list, marks: list, handwriting: Optional[str]) -> str:
+    block_text = "\n".join(f"[{i + 1}] {b}" for i, b in enumerate(blocks)) or "(none)"
+    mark_text = "\n".join(f"- {m.get('text', m) if isinstance(m, dict) else m}" for m in marks)
+    return COMPOSE_PROMPT.format(
+        blocks=block_text,
+        marks=mark_text or "(none)",
+        handwriting=(handwriting or "").strip() or "(none)",
+    )
+
+
+def _parse_json_object(text: str) -> Optional[dict]:
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        data = json.loads(text[start : end + 1])
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def compose_annotations(
+    png: bytes,
+    blocks: list,
+    marks: list,
+    handwriting: Optional[str],
+    timeout: float = 180.0,
+    model: Optional[str] = None,
+) -> Optional[dict]:
+    """Annotations of a PDF page as {"items", "unplaced_notes"} (cached), or None.
+
+    The model sees the page with its ink, the printed text, the geometric
+    marks and the handwriting transcript, and ties notes, symbols and labels
+    to the passages they belong to. REMARKABLE_ANNOTATION_MODEL picks the
+    model (default: the configured Claude model).
+    """
+    model = (model or os.environ.get("REMARKABLE_ANNOTATION_MODEL", "")).strip()
+    backend = backend_for_model(model) if model else "anthropic"
+    if backend is None or not has_credentials(backend):
+        return None
+    model = model or _model_for(backend)
+    prompt = build_compose_prompt(blocks, marks, handwriting)
+    path = None
+    if _cache_enabled():
+        h = hashlib.sha256()
+        h.update(png)
+        h.update(f"\0compose\0{COMPOSE_VERSION}\0{backend}\0{model}\0".encode())
+        h.update(prompt.encode())
+        digest = h.hexdigest()
+        path = _cache_dir() / "composed" / digest[:2] / f"{digest}.json"
+        cached = _cache_get(path)
+        if cached is not None:
+            return _parse_json_object(cached)
+    try:
+        text = _CALLERS[backend](png, model, prompt, timeout)
+    except Exception as e:
+        logger.warning("Composing annotations failed: %s", e)
+        return None
+    if not text:
+        return None
+    data = _parse_json_object(text)
+    if data is not None and path:
+        _cache_put(path, json.dumps(data, ensure_ascii=False))
+    return data

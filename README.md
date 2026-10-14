@@ -747,6 +747,20 @@ a note written between or over the printed lines. A line marks a word when it
 covers most of the word's width on the word or just below it. Scanned PDFs
 without a text layer fall back to OCR of all ink.
 
+**Notes tied to what they are about.** After the handwriting is read, a final
+pass (Claude, with the page image, the printed text, the marks and the
+handwriting transcript) writes the page's annotations: each marked passage in
+its whole sentence or paragraph with the marked words in bold, the note that
+belongs to it (written beside it, joined to it by a line, or written at the
+reference it comments on), labels such as (I) that a note refers back to, and
+the reader's own symbols set apart as ✎ **?** or ✎ **!**. A vertical line in
+the margin quotes the whole paragraph. Marks in a table come out as the table's
+caption, its headers and only the marked rows, with … for the rows left out.
+Quotes are checked against the PDF's text and anything not found there is
+dropped; the page's full handwriting stays available below. About one call per
+annotated PDF page; `REMARKABLE_COMPOSE_ANNOTATIONS=0` turns it off and
+`REMARKABLE_ANNOTATION_MODEL` picks the model.
+
 ### Example configuration
 
 [`examples/claude_desktop_config.example.json`](examples/claude_desktop_config.example.json)

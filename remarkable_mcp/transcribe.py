@@ -61,6 +61,8 @@ class PageResult:
     # Passages the pen marked on a PDF page (from the text layer, no OCR):
     # [{"text": sentence with **marks**, "marked", "kind"}]
     marked: List[dict] = field(default_factory=list)
+    # Marks, notes and symbols tied together on a PDF page (see compose_annotations)
+    annotations: Optional[dict] = None
 
 
 @dataclass
@@ -221,6 +223,9 @@ TRANSCRIPT_LABELS: Dict[str, Dict[str, str]] = {
         "doubtful": "{n} doubtful",
         "suggestions": "{n} suggestions",
         "marked": "Marked in the text",
+        "annotations": "Annotations",
+        "unplaced": "Other handwriting on the page",
+        "page_handwriting": "All handwriting on the page",
         "handwriting": "Handwriting",
         "illegible": "{n} illegible",
     },
@@ -250,6 +255,9 @@ TRANSCRIPT_LABELS: Dict[str, Dict[str, str]] = {
         "doubtful": "{n} epävarmaa",
         "suggestions": "{n} ehdotusta",
         "marked": "Merkityt kohdat",
+        "annotations": "Merkinnät",
+        "unplaced": "Muu käsiala sivulla",
+        "page_handwriting": "Sivun käsiala kokonaan",
         "handwriting": "Käsiala",
         "illegible": "{n} lukukelvotonta",
     },
@@ -261,6 +269,44 @@ def marked_line(mark, lab: Optional[Dict[str, str]] = None) -> str:
     if isinstance(mark, str):  # transcripts written before marks had context
         return f"- {mark}"
     return f"- {mark.get('text') or mark.get('marked', '')}"
+
+
+def _symbols(symbols) -> str:
+    """The reader's own drawn symbols, set apart from the text: ✎ **?**"""
+    marks = [str(x) for x in symbols or [] if str(x).strip()]
+    return (" ✎ " + " ".join(f"**{m}**" for m in marks)) if marks else ""
+
+
+def annotation_lines(ann: dict, lab: Optional[Dict[str, str]] = None) -> List[str]:
+    """Markdown for a page's composed annotations: passages, tables, loose notes."""
+    lab = lab or labels()
+    lines = [f"_{lab['annotations']}:_", ""]
+    for item in ann.get("items") or []:
+        if item.get("type") == "table":
+            headers = [str(h) for h in item.get("headers") or []]
+            rows = [r for r in item.get("rows") or []]
+            width = max([len(headers)] + [len(r) for r in rows if isinstance(r, list)] + [1])
+            if item.get("caption"):
+                lines += [f"**{item['caption']}**{_symbols(item.get('symbols'))}", ""]
+            head = headers + [""] * (width - len(headers))
+            lines.append("| " + " | ".join(head) + " |")
+            lines.append("|" + " --- |" * width)
+            for row in rows:
+                cells = row if isinstance(row, list) else ["…"]
+                cells = [str(c).replace("|", "\\|") for c in cells]
+                lines.append("| " + " | ".join(cells + [""] * (width - len(cells))) + " |")
+            if item.get("note"):
+                lines += ["", f"✍ {item['note']}"]
+            lines.append("")
+            continue
+        label = f"**({item['label']})** " if item.get("label") else ""
+        lines.append(f"- {label}{item.get('quote', '')}{_symbols(item.get('symbols'))}")
+        if item.get("note"):
+            lines.append(f"  - ✍ {item['note']}")
+    notes = ann.get("unplaced_notes") or []
+    if notes:
+        lines += ["", f"_{lab['unplaced']}:_", ""] + [f"- ✍ {n}" for n in notes]
+    return lines
 
 
 def labels() -> Dict[str, str]:
@@ -353,6 +399,12 @@ def write_outputs(job: Job) -> None:
         if r.status == "failed":
             lines += [f"_{lab['failed']}: {r.error}_", ""]
             continue
+        if r.annotations:
+            lines += annotation_lines(r.annotations, lab) + [""]
+            if r.final:
+                lines += [f"<details><summary>{lab['page_handwriting']}</summary>", ""]
+                lines += [r.final, "", "</details>", ""]
+            continue
         if r.marked:
             lines += [f"_{lab['marked']}:_", ""] + [marked_line(m, lab) for m in r.marked] + [""]
         if not r.final:
@@ -394,6 +446,7 @@ def write_outputs(job: Job) -> None:
                         "page_id": job.page_id(p),
                         "status": r.status,
                         "marked": r.marked,
+                        "annotations": r.annotations,
                         "final": r.final,
                         "readings": r.readings,
                         "agreement": r.agreement,
@@ -536,6 +589,36 @@ async def _adjudicate_page(job: Job, zip_path: Path, page: int, render, sem) -> 
             r.status = "done"  # keep the first reader's text rather than lose the page
 
 
+def _composing_enabled() -> bool:
+    return os.environ.get("REMARKABLE_COMPOSE_ANNOTATIONS", "1").strip() not in ("0", "false", "")
+
+
+async def _compose_page(job: Job, page: int, sem) -> None:
+    """Phase 3 (PDF pages): tie marks, notes and symbols to the printed text."""
+    from remarkable_mcp import extract
+    from remarkable_mcp.concurrency import run_blocking
+
+    r = job.results[page]
+    llm_ocr.USAGE_SINK.set(job.usage)
+    async with sem:
+        try:
+            inputs = await run_blocking(extract.pdf_page_annotation_inputs, job.extracted, page)
+            if inputs is None:
+                return
+            data = await run_blocking(
+                llm_ocr.compose_annotations,
+                inputs["png"],
+                inputs["blocks"],
+                r.marked,
+                r.final,
+                180.0,
+                job.models.get("judge"),
+            )
+            r.annotations = extract.checked_annotations(data, inputs["blocks"])
+        except Exception as e:  # the geometric marks and the handwriting remain
+            logger.warning("Composing annotations of page %s failed: %s", page, e)
+
+
 async def run_job(job: Job, raw_doc: bytes, render, workers: int) -> None:
     tmp = None
     unpacked = None
@@ -554,6 +637,14 @@ async def run_job(job: Job, raw_doc: bytes, render, workers: int) -> None:
         await asyncio.gather(*(_read_page(job, tmp, p, render, sem) for p in job.pages))
         pending = [p for p in job.pages if job.results[p].status == "pending"]
         await asyncio.gather(*(_adjudicate_page(job, tmp, p, render, sem) for p in pending))
+        if job.extracted is not None and _composing_enabled():
+            annotated = [
+                p
+                for p in job.pages
+                if job.results[p].status == "done"
+                and (job.results[p].marked or job.results[p].final)
+            ]
+            await asyncio.gather(*(_compose_page(job, p, sem) for p in annotated))
         if any(r.status != "blank" for r in job.results.values()):
             write_outputs(job)  # a document without handwriting leaves no files behind
         job.state = "done"
@@ -814,6 +905,8 @@ def load_transcript(document_id: Optional[str]) -> Optional[dict]:
 def transcript_page_text(page: dict, lab: Optional[Dict[str, str]] = None) -> str:
     """A transcript page as text: the marked phrases, then the handwriting."""
     lab = lab or labels()
+    if page.get("annotations"):
+        return "\n".join(annotation_lines(page["annotations"], lab)).strip()
     parts = []
     if page.get("marked"):
         parts.append(f"{lab['marked']}:")

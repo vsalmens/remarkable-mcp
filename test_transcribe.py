@@ -998,3 +998,118 @@ def test_soft_hyphen_and_stray_short_words():
     assert find_marked_words(mask, words, 1.0) == [
         {"text": "conscious **contents.**", "marked": "contents.", "kind": "underline"}
     ]
+
+
+def test_composed_annotations_keep_only_text_that_is_on_the_page():
+    from remarkable_mcp.extract import checked_annotations
+
+    blocks = [
+        "Because of some of these reactions, PIs are often considered potentially "
+        "unethical because they can be deceptive or manipulative.",
+        "Table 1. Summary of Associations",
+        "Skills or methods Distal end-of-treatment outcomes Questions Neutral/mixed",
+    ]
+    data = {
+        "items": [
+            {
+                "type": "passage",
+                "quote": "PIs are **often considered potentially unethical** because they can be "
+                "deceptive or manipulative.",
+                "note": "manipulaatiota?",
+                "symbols": ["?"],
+            },
+            {"type": "passage", "quote": "PIs are **always harmful.**"},  # not on the page
+            {"type": "passage", "quote": "Because of some of these reactions"},  # no mark
+            {
+                "type": "table",
+                "caption": "Table 1. Summary of Associations",
+                "headers": ["Skills or methods"],
+                "rows": ["…", ["Questions ✎?", "**Neutral/mixed**"], "…"],
+            },
+        ],
+        "unplaced_notes": ["orch OR"],
+    }
+    kept = checked_annotations(data, blocks)
+    assert [i["type"] for i in kept["items"]] == ["passage", "table"]
+    assert kept["unplaced_notes"] == ["orch OR"]
+    assert checked_annotations({"items": [], "unplaced_notes": []}, blocks) is None
+
+
+def test_annotation_markdown_sets_the_readers_own_marks_apart(monkeypatch):
+    monkeypatch.setenv("REMARKABLE_TRANSCRIPT_LANG", "en")
+    ann = {
+        "items": [
+            {
+                "type": "passage",
+                "quote": "States of consciousness can be grouped into two classes: "
+                "**global states and local states.**",
+                "label": "I",
+                "symbols": ["!"],
+                "note": "tietoisuus kokemuksena",
+            },
+            {
+                "type": "table",
+                "caption": "Table 1. Summary",
+                "headers": ["Skills or methods", "Distal"],
+                "rows": ["…", ["**Paradoxical interventions**", "**Demonstrably effective**"], "…"],
+            },
+        ],
+        "unplaced_notes": ["Ha ff"],
+    }
+    md = "\n".join(transcribe.annotation_lines(ann))
+    assert (
+        "- **(I)** States of consciousness can be grouped into two classes: "
+        "**global states and local states.** ✎ **!**" in md
+    )
+    assert "  - ✍ tietoisuus kokemuksena" in md
+    assert "| Skills or methods | Distal |" in md and "| … |  |" in md
+    assert "| **Paradoxical interventions** | **Demonstrably effective** |" in md
+    assert "- ✍ Ha ff" in md
+
+
+def test_pdf_job_composes_annotations(tmp_path, monkeypatch):
+    from remarkable_mcp.extract import analyze_pdf_page_annotations
+
+    monkeypatch.setenv("REMARKABLE_TRANSCRIPT_LANG", "en")
+    path = _annotated_pdf_zip(tmp_path)
+    seen = {}
+
+    def compose(png, blocks, marks, handwriting, *a):
+        seen["blocks"], seen["marks"], seen["handwriting"] = blocks, marks, handwriting
+        return {
+            "items": [
+                {
+                    "type": "passage",
+                    "quote": "Self **efficacy predicts** adherence strongly",
+                    "note": "see ch. 2",
+                }
+            ],
+            "unplaced_notes": [],
+        }
+
+    async def go():
+        job = transcribe.start_job(
+            document="Paper.pdf",
+            path="/R/Paper.pdf",
+            mode="dual",
+            pages=[1],
+            total_pages=1,
+            raw_doc=path.read_bytes(),
+            render=lambda z, p: INK,
+            workers=1,
+            annotate=analyze_pdf_page_annotations,
+        )
+        await job.task
+        return job
+
+    with (
+        patch("remarkable_mcp.llm_ocr.ocr_png", side_effect=lambda png, b, *a: "see ch. 2"),
+        patch("remarkable_mcp.llm_ocr.compose_annotations", side_effect=compose),
+    ):
+        job = asyncio.run(go())
+    r = job.results[1]
+    assert r.annotations["items"][0]["note"] == "see ch. 2"
+    assert any("efficacy predicts" in b for b in seen["blocks"])
+    assert seen["handwriting"] == "see ch. 2"
+    md = open(transcribe.summarize(job)["output_markdown"], encoding="utf-8").read()
+    assert "- Self **efficacy predicts** adherence strongly" in md and "  - ✍ see ch. 2" in md

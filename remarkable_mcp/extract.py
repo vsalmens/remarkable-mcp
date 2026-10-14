@@ -2971,3 +2971,94 @@ def _analyze_extracted(tmpdir_path: Path, page: int, scale: float) -> Optional[D
         residual.point(lambda v: 0 if v else 255).save(buf, format="PNG")  # black ink on white
         result["residual_png"] = buf.getvalue()
     return result
+
+
+def _normalize_page_text(text: str) -> str:
+    """PDF text as running prose: ligatures undone, line-break hyphens joined."""
+    import unicodedata
+
+    text = unicodedata.normalize("NFKC", text).replace("­\n", "").replace("­", "")
+    text = re.sub(r"(\w)[-‐]\n(?=[a-z])", r"\1", text)
+    return " ".join(text.split())
+
+
+def pdf_page_annotation_inputs(extracted: Path, page: int, max_side: int = 1568) -> Optional[dict]:
+    """The page image with its ink and the printed text blocks, for composing annotations.
+
+    Returns {"png", "blocks"} or None when the page has no PDF underlay.
+    """
+    import io
+
+    import fitz
+    from PIL import Image
+
+    pdf_index = _resolve_pdf_page_index(extracted, page)
+    pdf_files = list(extracted.glob("**/*.pdf"))
+    if pdf_index is None or not pdf_files:
+        return None
+    stems = {p.stem for p in extracted.glob("*.content")}
+    matching = [p for p in pdf_files if p.stem in stems]
+    pdf_path = matching[0] if matching else sorted(pdf_files)[0]
+    try:
+        with fitz.open(pdf_path) as doc:
+            if pdf_index >= len(doc):
+                return None
+            raw_blocks = doc[pdf_index].get_text("blocks")
+    except Exception:
+        return None
+    blocks = [_normalize_page_text(b[4]) for b in raw_blocks if b[6] == 0 and b[4].strip()]
+    png, _ = render_merged_page_from_extracted_document(extracted, page=page)
+    if png is None:
+        return None
+    image = Image.open(io.BytesIO(png))
+    if max(image.size) > max_side:
+        image.thumbnail((max_side, max_side))
+        buf = io.BytesIO()
+        image.convert("RGB").save(buf, format="PNG")
+        png = buf.getvalue()
+    return {"png": png, "blocks": blocks}
+
+
+def _letters(text: str) -> str:
+    import unicodedata
+
+    text = unicodedata.normalize("NFKC", text).replace("­", "")
+    return re.sub(r"[\W_]+", "", text).lower()
+
+
+def checked_annotations(data: Optional[dict], blocks: list) -> Optional[dict]:
+    """Keep only annotation items whose printed text is really on the page.
+
+    A quote or table cell that cannot be found in the page's text (after
+    removing the ** marks, spacing and punctuation) is dropped, so the
+    composed annotations never put words in the author's mouth.
+    """
+    if not isinstance(data, dict):
+        return None
+    page = _letters(" ".join(blocks))
+    items = []
+    for item in data.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "table":
+            cells = [
+                c
+                for row in item.get("rows") or []
+                if isinstance(row, list)
+                for c in row
+                if isinstance(c, str)
+            ]
+            words = [
+                _letters(c.split("✎")[0].replace("**", ""))
+                for c in cells + [item.get("caption", "")]
+            ]
+            if cells and all(w in page for w in words if w):
+                items.append(item)
+        elif item.get("type") == "passage" and isinstance(item.get("quote"), str):
+            quote = _letters(item["quote"].replace("**", "").replace("…", " "))
+            if quote and quote in page and "**" in item["quote"]:
+                items.append(item)
+    notes = [n for n in data.get("unplaced_notes") or [] if isinstance(n, str) and n.strip()]
+    if not items and not notes:
+        return None
+    return {"items": items, "unplaced_notes": notes}
