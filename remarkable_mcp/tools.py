@@ -3111,29 +3111,56 @@ def _env_number(name: str, default: float) -> float:
         return default
 
 
+def _in_quiet_hours(spec: str, hour: int) -> bool:
+    """Whether ``hour`` falls in a "23-7" style range (end exclusive, may wrap midnight)."""
+    try:
+        start, end = (int(part) % 24 for part in spec.split("-", 1))
+    except ValueError:
+        return False
+    if start == end:
+        return False
+    return start <= hour < end if start < end else hour >= start or hour < end
+
+
 async def _auto_sync_loop() -> None:
     """Transcribe new and changed documents soon after they reach the cloud.
 
-    Every REMARKABLE_AUTO_SYNC_MINUTES the library is compared with the index;
-    a document is taken once it has been left alone for
+    The library is compared with the index every REMARKABLE_AUTO_SYNC_MINUTES
+    (e.g. 60). After a change it is checked more often, every
+    REMARKABLE_AUTO_SYNC_ACTIVE_MINUTES (default 10), for
+    REMARKABLE_AUTO_SYNC_ACTIVE_HOURS (default 3): while you are writing,
+    pages arrive quickly; a library that has not changed in months is barely
+    polled. A document is taken once it has been left alone for
     REMARKABLE_AUTO_SYNC_SETTLE_MINUTES (default 10), so a page is not read
     while it is still being written. Runs of more than
     REMARKABLE_AUTO_SYNC_MAX_DOCS documents (default 20, e.g. the first full
-    pass) are left for a manual remarkable_transcribe_sync().
+    pass) are left for a manual remarkable_transcribe_sync(). No checks are made
+    during REMARKABLE_AUTO_SYNC_QUIET_HOURS (local time, e.g. "23-7").
     """
     import asyncio
+    import time
 
     from remarkable_mcp import transcribe
 
-    interval = _env_number("REMARKABLE_AUTO_SYNC_MINUTES", 0) * 60
+    idle = _env_number("REMARKABLE_AUTO_SYNC_MINUTES", 0) * 60
+    active = min(idle, _env_number("REMARKABLE_AUTO_SYNC_ACTIVE_MINUTES", 10) * 60)
+    window = _env_number("REMARKABLE_AUTO_SYNC_ACTIVE_HOURS", 3) * 3600
     settle = _env_number("REMARKABLE_AUTO_SYNC_SETTLE_MINUTES", 10) * 60
     limit = int(_env_number("REMARKABLE_AUTO_SYNC_MAX_DOCS", 20))
+    quiet = os.environ.get("REMARKABLE_AUTO_SYNC_QUIET_HOURS", "").strip()
+    last_change = 0.0
     while True:
-        await asyncio.sleep(interval)
+        recent = time.time() - last_change < window
+        await asyncio.sleep(active if recent else idle)
+        if quiet and _in_quiet_hours(quiet, datetime.now().hour):
+            continue
         if transcribe.running_sync() is not None:
             continue
         try:
             response, run = await _sync_library(settle_seconds=settle, max_documents=limit)
+            found = json.loads(response)
+            if any(found.get(k) for k in ("new", "changed", "still_being_written")):
+                last_change = time.time()
             if run is not None:
                 logger.info("Auto-sync %s started: %s", run.id, response)
         except Exception as e:  # never let the loop die

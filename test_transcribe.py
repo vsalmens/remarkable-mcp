@@ -907,3 +907,11 @@ def test_auto_sync_is_off_unless_configured(monkeypatch):
 
     monkeypatch.delenv("REMARKABLE_AUTO_SYNC_MINUTES", raising=False)
     assert tools.start_auto_sync() is None
+
+
+def test_quiet_hours_wrap_midnight():
+    from remarkable_mcp.tools import _in_quiet_hours
+
+    assert [h for h in range(24) if _in_quiet_hours("23-7", h)] == [0, 1, 2, 3, 4, 5, 6, 23]
+    assert [h for h in range(24) if _in_quiet_hours("1-3", h)] == [1, 2]
+    assert not _in_quiet_hours("", 2) and not _in_quiet_hours("nonsense", 2)
