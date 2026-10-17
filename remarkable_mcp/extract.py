@@ -3,6 +3,7 @@ Text extraction helpers for reMarkable documents.
 """
 
 import json
+from datetime import datetime
 import logging
 import os
 import re
@@ -1968,6 +1969,43 @@ def get_page_ids_from_zip(zip_path: Path) -> List[Optional[str]]:
     if isinstance(data.get("pages"), list):
         return [p if isinstance(p, str) else None for p in data["pages"]]
     return []
+
+
+def get_page_times_from_zip(zip_path: Path) -> List[Optional[str]]:
+    """When each page was last written, in page order (None where the device did not say).
+
+    Format 2 .content files carry ``cPages.pages[].modifed`` (sic) as epoch
+    milliseconds on pages written since the field appeared; older pages and
+    format 1 documents have nothing. The list is aligned with get_page_ids_from_zip.
+    """
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            name = next((n for n in zf.namelist() if n.endswith(".content")), None)
+            if name is None:
+                return []
+            data = json.loads(zf.read(name))
+    except Exception:
+        return []
+    if not (isinstance(data.get("cPages"), dict) and isinstance(data["cPages"].get("pages"), list)):
+        return []
+    return [page_time_of(p) if isinstance(p, dict) else None for p in data["cPages"]["pages"]]
+
+
+def page_time_of(entry: Dict[str, Any]) -> Optional[str]:
+    """The ISO time of a cPages entry's ``modifed``/``modified`` epoch-millisecond stamp, or None."""
+    value = entry.get("modifed", entry.get("modified"))
+    if isinstance(value, dict):
+        value = value.get("value")
+    try:
+        millis = int(value)
+    except (TypeError, ValueError):
+        return None
+    if millis <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(millis / 1000).astimezone().isoformat(timespec="seconds")
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def get_document_page_count(zip_path: Path) -> int:

@@ -87,6 +87,7 @@ class Job:
     document_id: Optional[str] = None
     modified: Optional[str] = None  # document modification time (ISO 8601)
     page_ids: List[Optional[str]] = field(default_factory=list)  # stable ids, page order
+    page_times: List[Optional[str]] = field(default_factory=list)  # when each page was last written (ISO), page order
     usage: Dict[str, dict] = field(default_factory=dict)  # model -> calls/tokens
     # PDF pages: callable(source, page) -> {"marked", "residual_png"} or None
     annotate: Optional[Callable] = None
@@ -97,6 +98,9 @@ class Job:
 
     def page_id(self, page: int) -> Optional[str]:
         return self.page_ids[page - 1] if 0 < page <= len(self.page_ids) else None
+
+    def page_time(self, page: int) -> Optional[str]:
+        return self.page_times[page - 1] if 0 < page <= len(self.page_times) else None
 
 
 # ---------------------------------------------------------------------------
@@ -578,6 +582,7 @@ def write_outputs(job: Job) -> None:
                 "pages": {
                     str(p): {
                         "page_id": job.page_id(p),
+                        "modified": job.page_time(p),
                         "status": r.status,
                         "marked": r.marked,
                         "annotations": r.annotations,
@@ -907,6 +912,7 @@ def start_job(
     page_ids: Optional[List[Optional[str]]] = None,
     annotate: Optional[Callable] = None,
     batch: bool = False,
+    page_times: Optional[List[Optional[str]]] = None,
 ) -> Job:
     job = Job(
         id=uuid.uuid4().hex[:8],
@@ -919,6 +925,7 @@ def start_job(
         document_id=document_id,
         modified=modified,
         page_ids=list(page_ids or []),
+        page_times=list(page_times or []),
         annotate=annotate,
         batch=batch,
     )

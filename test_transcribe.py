@@ -476,6 +476,7 @@ def test_page_ids_and_document_id_in_json(tmp_path):
             document_id="doc-9",
             modified="2026-10-14T10:00:00",
             page_ids=["p-a", "p-b"],
+            page_times=[None, "2026-08-08T07:48:41+03:00"],
         ),
         {1: INK, 2: INK},
         lambda png, b: "text",
@@ -483,6 +484,7 @@ def test_page_ids_and_document_id_in_json(tmp_path):
     data = json.load(open(transcribe.summarize(job)["output_json"], encoding="utf-8"))
     assert data["document_id"] == "doc-9" and data["modified"] == "2026-10-14T10:00:00"
     assert [data["pages"][k]["page_id"] for k in ("1", "2")] == ["p-a", "p-b"]
+    assert [data["pages"][k]["modified"] for k in ("1", "2")] == [None, "2026-08-08T07:48:41+03:00"]
 
 
 def test_page_ids_from_zip(tmp_path):
@@ -496,6 +498,17 @@ def test_page_ids_from_zip(tmp_path):
             "x.content", json.dumps({"cPages": {"pages": [{"id": "a"}, {"idx": 1}, {"id": "c"}]}})
         )
     assert get_page_ids_from_zip(z) == ["a", None, "c"]
+    from remarkable_mcp.extract import get_page_times_from_zip, page_time_of
+
+    with zipfile.ZipFile(z, "w") as zf:
+        zf.writestr(
+            "x.content",
+            json.dumps({"cPages": {"pages": [{"id": "a"}, {"id": "b", "modifed": "1786342121862"}, {"id": "c", "modified": 0}]}}),
+        )
+    times = get_page_times_from_zip(z)
+    assert times[0] is None and times[2] is None and times[1].startswith("2026-08-1")  # the device misspells the key
+    assert page_time_of({"modifed": {"timestamp": "1:1", "value": "1786342121862"}}) == times[1]
+    assert page_time_of({"modifed": "nonsense"}) is None
     with zipfile.ZipFile(z, "w") as zf:
         zf.writestr("x.content", json.dumps({"pages": ["p1", "p2"]}))
     assert get_page_ids_from_zip(z) == ["p1", "p2"]

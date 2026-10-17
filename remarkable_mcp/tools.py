@@ -59,6 +59,7 @@ from remarkable_mcp.extract import (
     get_document_page_count,
     get_ocr_backend,
     get_page_ids_from_zip,
+    get_page_times_from_zip,
     render_mapped_pdf_page_from_document_zip,
     render_merged_page_from_document_zip,
     render_page_from_document_zip,
@@ -2766,6 +2767,7 @@ def _page_count_and_ids(raw_doc: bytes):
             get_document_page_count(tmp_path),
             get_page_ids_from_zip(tmp_path),
             document_has_pdf(tmp_path),
+            get_page_times_from_zip(tmp_path),
         )
     finally:
         tmp_path.unlink(missing_ok=True)
@@ -2792,7 +2794,7 @@ async def _start_transcription(
             "This transport returned a flattened PDF without an ink layer.",
             "Use the cloud or SSH transport for transcription.",
         )
-    total, page_ids, has_pdf = await run_blocking(_page_count_and_ids, raw_doc)
+    total, page_ids, has_pdf, page_times = await run_blocking(_page_count_and_ids, raw_doc)
     try:
         page_list = transcribe.parse_pages(pages, total)
     except ValueError as e:
@@ -2814,6 +2816,7 @@ async def _start_transcription(
         document_id=getattr(target_doc, "ID", None),
         modified=_modified_iso(target_doc),
         page_ids=page_ids,
+        page_times=page_times,
         # PDF pages: marked printed text from the text layer, OCR only for handwriting
         annotate=analyze_pdf_page_annotations if has_pdf else None,
         batch=batch,
